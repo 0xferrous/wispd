@@ -55,7 +55,7 @@ TOML-configurable:
 - gap
 - max_visible
 - width
-- height
+- height (used as minimum popup height; final height grows with content)
 - urgency colors (`low`, `normal`, `critical`)
 - per-notification padding
 - font size

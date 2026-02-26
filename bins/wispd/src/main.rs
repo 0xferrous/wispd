@@ -63,7 +63,7 @@ impl Default for UiSection {
             format: "{app_name}: {summary}\n{body}".to_string(),
             max_visible: 5,
             width: 420,
-            height: 420,
+            height: 140,
             gap: 8,
             padding: 10,
             font_size: 15,
@@ -200,9 +200,10 @@ impl WispdUi {
         }
 
         let mut tasks = Vec::new();
+        let popup_height = self.popup_height_for_id(id);
 
         let (window_id, open_task) = Message::layershell_open(NewLayerShellSettings {
-            size: Some((self.ui.width.max(1), self.ui.height.max(1))),
+            size: Some((self.ui.width.max(1), popup_height.max(1))),
             layer: Layer::Top,
             anchor: layer_anchor_from_str(&self.ui.anchor),
             exclusive_zone: Some(0),
@@ -248,9 +249,10 @@ impl WispdUi {
 
     fn relayout_task(&self) -> Task<Message> {
         let anchor = layer_anchor_from_str(&self.ui.anchor);
-        let step = self.ui.height as i32 + self.ui.gap as i32;
+        let mut offset = 0_i32;
 
-        let updates = self.windows.iter().enumerate().map(|(idx, binding)| {
+        let updates = self.windows.iter().map(|binding| {
+            let popup_height = self.popup_height_for_id(binding.notification_id);
             let mut margin = (
                 self.ui.margin.top,
                 self.ui.margin.right,
@@ -259,10 +261,11 @@ impl WispdUi {
             );
 
             if anchor.contains(Anchor::Top) {
-                margin.0 += step * idx as i32;
+                margin.0 += offset;
             } else {
-                margin.2 += step * idx as i32;
+                margin.2 += offset;
             }
+            offset += popup_height as i32 + self.ui.gap as i32;
 
             Task::batch([
                 Task::done(Message::MarginChange {
@@ -272,12 +275,19 @@ impl WispdUi {
                 Task::done(Message::AnchorSizeChange {
                     id: binding.window_id,
                     anchor,
-                    size: (self.ui.width.max(1), self.ui.height.max(1)),
+                    size: (self.ui.width.max(1), popup_height.max(1)),
                 }),
             ])
         });
 
         Task::batch(updates)
+    }
+
+    fn popup_height_for_id(&self, id: u32) -> u32 {
+        self.notifications
+            .get(&id)
+            .map(|n| estimate_popup_height(&self.ui, n))
+            .unwrap_or(self.ui.height.max(1))
     }
 }
 
@@ -338,7 +348,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
         .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
     let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
     let card_width = state.ui.width as f32;
-    let card_height = state.ui.height as f32;
+    let card_height = estimate_popup_height(&state.ui, n) as f32;
     let card_padding = state.ui.padding;
     let font_size = state.ui.font_size as u32;
 
@@ -379,6 +389,28 @@ fn render_format(format: &str, n: &UiNotification) -> String {
         .replace("{summary}", &n.summary)
         .replace("{body}", &n.body)
         .replace("{urgency}", urgency_label(n.urgency.clone()))
+}
+
+fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
+    let rendered = render_format(&ui.format, n);
+    let content_width_px = (ui.width as f32 - (ui.padding as f32 * 2.0)).max(80.0);
+    let approx_char_width = (ui.font_size as f32 * 0.56).max(1.0);
+    let chars_per_line = (content_width_px / approx_char_width).floor().max(1.0) as usize;
+
+    let wrapped_lines = rendered
+        .lines()
+        .map(|line| {
+            let chars = line.chars().count().max(1);
+            chars.div_ceil(chars_per_line)
+        })
+        .sum::<usize>()
+        .max(1);
+
+    let line_height = (ui.font_size as f32 * 1.35).ceil() as u32;
+    let text_height = wrapped_lines as u32 * line_height;
+    let chrome = ui.padding as u32 * 2 + 8;
+
+    text_height.saturating_add(chrome).max(ui.height.max(1))
 }
 
 fn urgency_label(urgency: Urgency) -> &'static str {
