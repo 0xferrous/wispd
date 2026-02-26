@@ -192,9 +192,10 @@ fn main() -> Result<()> {
     let settings = Settings {
         layer_settings: LayerShellSettings {
             anchor: Anchor::Top | Anchor::Right,
-            layer: Layer::Top,
+            layer: Layer::Overlay,
+            exclusive_zone: 0,
             margin: (16, 16, 16, 16),
-            size: Some((420, 0)),
+            size: Some((420, 300)),
             ..Default::default()
         },
         ..Default::default()
