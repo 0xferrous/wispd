@@ -4,7 +4,7 @@ Status: draft, locked decisions from implementation planning.
 
 ## 1. Core display
 
-Each notification is rendered as a separate popup card/window-like block in a stack (not a single persistent combined panel).
+Each notification is rendered as a separate layer-shell popup surface (one window per notification), not as one combined panel surface.
 
 UI rendering is format-string based.
 

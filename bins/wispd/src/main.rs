@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     path::PathBuf,
@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Result, anyhow};
 use iced::widget::{column, container, text};
 use iced::{Background, Color, Element, Length, Subscription, Task, border};
-use iced_layershell::application;
-use iced_layershell::reexport::{Anchor, Layer};
+use iced_layershell::daemon;
+use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use serde::Deserialize;
@@ -125,10 +125,17 @@ struct UiNotification {
     urgency: Urgency,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WindowBinding {
+    window_id: IcedId,
+    notification_id: u32,
+}
+
 #[derive(Debug)]
 struct WispdUi {
     events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
-    notifications: VecDeque<UiNotification>,
+    notifications: HashMap<u32, UiNotification>,
+    windows: VecDeque<WindowBinding>,
     ui: UiSection,
 }
 
@@ -136,12 +143,13 @@ impl WispdUi {
     fn new(events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>, ui: UiSection) -> Self {
         Self {
             events,
-            notifications: VecDeque::new(),
+            notifications: HashMap::new(),
+            windows: VecDeque::new(),
             ui,
         }
     }
 
-    fn on_tick(&mut self) {
+    fn on_tick(&mut self) -> Task<Message> {
         let mut pending = Vec::new();
 
         if let Ok(receiver) = self.events.lock() {
@@ -158,46 +166,122 @@ impl WispdUi {
         }
 
         let processed = pending.len();
+        let mut tasks = Vec::new();
         for event in pending {
-            self.apply_event(event);
+            tasks.push(self.apply_event(event));
         }
 
         if processed > 0 {
-            info!(
-                processed,
-                visible = self.notifications.len(),
-                "ui state updated"
-            );
+            info!(processed, visible = self.windows.len(), "ui state updated");
         }
+
+        Task::batch(tasks)
     }
 
-    fn apply_event(&mut self, event: NotificationEvent) {
+    fn apply_event(&mut self, event: NotificationEvent) -> Task<Message> {
         match event {
-            NotificationEvent::Received { id, notification } => {
-                self.insert_new(id, *notification);
-            }
+            NotificationEvent::Received { id, notification } => self.insert_new(id, *notification),
             NotificationEvent::Replaced { id, current, .. } => {
-                if let Some(existing) = self.notifications.iter_mut().find(|n| n.id == id) {
-                    *existing = to_ui_notification(id, *current);
-                }
+                self.notifications
+                    .insert(id, to_ui_notification(id, *current));
+                Task::none()
             }
-            NotificationEvent::Closed { id, .. } => {
-                self.notifications.retain(|n| n.id != id);
-            }
-            NotificationEvent::ActionInvoked { .. } => {}
+            NotificationEvent::Closed { id, .. } => self.remove_notification(id),
+            NotificationEvent::ActionInvoked { .. } => Task::none(),
         }
     }
 
-    fn insert_new(&mut self, id: u32, notification: Notification) {
+    fn insert_new(&mut self, id: u32, notification: Notification) -> Task<Message> {
         self.notifications
-            .push_front(to_ui_notification(id, notification));
-        while self.notifications.len() > self.ui.max_visible {
-            let _ = self.notifications.pop_back();
+            .insert(id, to_ui_notification(id, notification));
+
+        if self.windows.iter().any(|w| w.notification_id == id) {
+            return Task::none();
         }
+
+        let mut tasks = Vec::new();
+
+        let (window_id, open_task) = Message::layershell_open(NewLayerShellSettings {
+            size: Some((self.ui.width.max(1), self.ui.height.max(1))),
+            layer: Layer::Top,
+            anchor: layer_anchor_from_str(&self.ui.anchor),
+            exclusive_zone: Some(0),
+            margin: Some((
+                self.ui.margin.top,
+                self.ui.margin.right,
+                self.ui.margin.bottom,
+                self.ui.margin.left,
+            )),
+            ..Default::default()
+        });
+        self.windows.push_front(WindowBinding {
+            window_id,
+            notification_id: id,
+        });
+        tasks.push(open_task);
+
+        while self.windows.len() > self.ui.max_visible {
+            if let Some(evicted) = self.windows.pop_back() {
+                self.notifications.remove(&evicted.notification_id);
+                tasks.push(Task::done(Message::RemoveWindow(evicted.window_id)));
+            }
+        }
+
+        tasks.push(self.relayout_task());
+        Task::batch(tasks)
+    }
+
+    fn remove_notification(&mut self, id: u32) -> Task<Message> {
+        self.notifications.remove(&id);
+
+        if let Some(index) = self.windows.iter().position(|w| w.notification_id == id)
+            && let Some(binding) = self.windows.remove(index)
+        {
+            return Task::batch([
+                Task::done(Message::RemoveWindow(binding.window_id)),
+                self.relayout_task(),
+            ]);
+        }
+
+        Task::none()
+    }
+
+    fn relayout_task(&self) -> Task<Message> {
+        let anchor = layer_anchor_from_str(&self.ui.anchor);
+        let step = self.ui.height as i32 + self.ui.gap as i32;
+
+        let updates = self.windows.iter().enumerate().map(|(idx, binding)| {
+            let mut margin = (
+                self.ui.margin.top,
+                self.ui.margin.right,
+                self.ui.margin.bottom,
+                self.ui.margin.left,
+            );
+
+            if anchor.contains(Anchor::Top) {
+                margin.0 += step * idx as i32;
+            } else {
+                margin.2 += step * idx as i32;
+            }
+
+            Task::batch([
+                Task::done(Message::MarginChange {
+                    id: binding.window_id,
+                    margin,
+                }),
+                Task::done(Message::AnchorSizeChange {
+                    id: binding.window_id,
+                    anchor,
+                    size: (self.ui.width.max(1), self.ui.height.max(1)),
+                }),
+            ])
+        });
+
+        Task::batch(updates)
     }
 }
 
-#[to_layer_message]
+#[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
@@ -214,9 +298,8 @@ fn subscription(_: &WispdUi) -> Subscription<Message> {
 fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
     match message {
         Message::Tick => state.on_tick(),
-        _ => unreachable!(),
+        _ => Task::none(),
     }
-    Task::none()
 }
 
 fn app_style(_state: &WispdUi, theme: &iced::Theme) -> iced::theme::Style {
@@ -226,33 +309,57 @@ fn app_style(_state: &WispdUi, theme: &iced::Theme) -> iced::theme::Style {
     }
 }
 
-fn view(state: &WispdUi) -> Element<'_, Message> {
-    let mut stack = column![].spacing(state.ui.gap as u32).width(Length::Shrink);
-
-    for n in &state.notifications {
-        let formatted = render_format(&state.ui.format, n);
-        let border_color = urgency_color(&state.ui.colors, n.urgency.clone());
-        let bg_color = parse_hex_color(&state.ui.colors.background)
-            .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
-        let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
-        let card_width = state.ui.width as f32;
-        let card_padding = state.ui.padding;
-        let font_size = state.ui.font_size as u32;
-
-        let card = container(text(formatted).size(font_size))
-            .padding(card_padding)
-            .width(Length::Fixed(card_width))
-            .style(move |_| {
+fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
+    let Some(binding) = state.windows.iter().find(|w| w.window_id == window_id) else {
+        return container(text(""))
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(1.0))
+            .style(|_| {
                 iced::widget::container::Style::default()
-                    .background(Background::Color(bg_color))
-                    .color(text_color)
-                    .border(border::width(2).color(border_color).rounded(10))
-            });
+                    .background(Background::Color(Color::TRANSPARENT))
+            })
+            .into();
+    };
 
-        stack = stack.push(card);
-    }
+    let Some(n) = state.notifications.get(&binding.notification_id) else {
+        return container(text(""))
+            .width(Length::Fixed(1.0))
+            .height(Length::Fixed(1.0))
+            .style(|_| {
+                iced::widget::container::Style::default()
+                    .background(Background::Color(Color::TRANSPARENT))
+            })
+            .into();
+    };
 
-    container(stack).width(Length::Shrink).into()
+    let formatted = render_format(&state.ui.format, n);
+    let border_color = urgency_color(&state.ui.colors, n.urgency.clone());
+    let bg_color = parse_hex_color(&state.ui.colors.background)
+        .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
+    let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
+    let card_width = state.ui.width as f32;
+    let card_height = state.ui.height as f32;
+    let card_padding = state.ui.padding;
+    let font_size = state.ui.font_size as u32;
+
+    let card = container(text(formatted).size(font_size))
+        .padding(card_padding)
+        .width(Length::Fixed(card_width))
+        .height(Length::Fixed(card_height))
+        .style(move |_| {
+            iced::widget::container::Style::default()
+                .background(Background::Color(bg_color))
+                .color(text_color)
+                .border(border::width(2).color(border_color).rounded(10))
+        });
+
+    container(column![card])
+        .width(Length::Shrink)
+        .style(|_| {
+            iced::widget::container::Style::default()
+                .background(Background::Color(Color::TRANSPARENT))
+        })
+        .into()
 }
 
 fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
@@ -441,24 +548,18 @@ fn main() -> Result<()> {
 
     let settings = Settings {
         layer_settings: LayerShellSettings {
-            anchor: layer_anchor_from_str(&app_cfg.ui.anchor),
-            // Keep this conservative for compositor compatibility.
+            // Bootstrap surface kept minimal; real notification windows are opened dynamically.
+            anchor: Anchor::Top | Anchor::Left,
             layer: Layer::Top,
             exclusive_zone: 0,
-            margin: (
-                app_cfg.ui.margin.top,
-                app_cfg.ui.margin.right,
-                app_cfg.ui.margin.bottom,
-                app_cfg.ui.margin.left,
-            ),
-            // Use explicit non-zero dimensions to avoid zwlr_layer_surface protocol errors.
-            size: Some((app_cfg.ui.width.max(1), app_cfg.ui.height.max(1))),
+            margin: (0, 0, 0, 0),
+            size: Some((1, 1)),
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let app = application(
+    let app = daemon(
         move || WispdUi::new(Arc::clone(&boot_events), ui_cfg.clone()),
         namespace,
         update,
@@ -508,11 +609,12 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
-        ui.apply_event(sample(1, "one"));
-        ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
 
-        assert_eq!(ui.notifications[0].id, 2);
-        assert_eq!(ui.notifications[1].id, 1);
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 2);
+        assert_eq!(ui.windows[1].notification_id, 1);
     }
 
     #[test]
@@ -520,9 +622,9 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
-        ui.apply_event(sample(1, "one"));
-        ui.apply_event(sample(2, "two"));
-        ui.apply_event(NotificationEvent::Replaced {
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(NotificationEvent::Replaced {
             id: 1,
             previous: Box::new(Notification::default()),
             current: Box::new(Notification {
@@ -531,8 +633,8 @@ mod tests {
             }),
         });
 
-        assert_eq!(ui.notifications[1].id, 1);
-        assert_eq!(ui.notifications[1].summary, "one-new");
+        assert_eq!(ui.windows[1].notification_id, 1);
+        assert_eq!(ui.notifications.get(&1).unwrap().summary, "one-new");
     }
 
     #[test]
@@ -540,8 +642,8 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
-        ui.apply_event(sample(1, "one"));
-        ui.apply_event(NotificationEvent::Closed {
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(NotificationEvent::Closed {
             id: 1,
             reason: CloseReason::ClosedByCall,
         });

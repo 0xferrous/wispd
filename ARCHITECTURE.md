@@ -39,7 +39,7 @@ bins/
 7. `wisp-source` emits `NotificationEvent` through `tokio::mpsc`.
 8. `wispd` runs `wisp-source` on a dedicated Tokio runtime thread and forwards events to the UI via a std channel.
 9. `wispd` applies queue policy (max visible, newest on top, replacement in-place).
-10. `wispd` renders notification popups via `iced` + `iced_layershell`.
+10. `wispd` opens one layer-shell window per visible notification and reflows their margins for stacking.
 
 ## 4) `wisp-source` responsibilities
 
