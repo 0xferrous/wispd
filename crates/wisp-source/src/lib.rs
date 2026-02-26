@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
@@ -89,7 +89,7 @@ pub struct WispSource {
 struct Inner {
     cfg: SourceConfig,
     sender: mpsc::Sender<NotificationEvent>,
-    notifications: RwLock<HashMap<u32, StoredNotification>>,
+    notifications: Mutex<HashMap<u32, StoredNotification>>,
     next_id: AtomicU32,
     dbus_connection: RwLock<Option<zbus::Connection>>,
 }
@@ -121,7 +121,7 @@ impl WispSource {
             inner: Arc::new(Inner {
                 cfg,
                 sender,
-                notifications: RwLock::new(HashMap::new()),
+                notifications: Mutex::new(HashMap::new()),
                 next_id: AtomicU32::new(1),
                 dbus_connection: RwLock::new(None),
             }),
@@ -171,8 +171,12 @@ impl WispSource {
     ) -> Result<u32, SourceError> {
         let timeout_ms = notification.timeout_ms;
         debug!(app = %notification.app_name, summary = %notification.summary, replaces_id, timeout_ms, "processing notification");
-        debug!("acquiring notifications write lock for notify");
-        let mut store = self.inner.notifications.write().await;
+        debug!("acquiring notifications lock for notify");
+        let mut store = self
+            .inner
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned");
 
         if replaces_id != 0
             && let Some(entry) = store.get_mut(&replaces_id)
@@ -219,7 +223,12 @@ impl WispSource {
     ///
     /// Returns `Ok(true)` if a notification was closed, `Ok(false)` if it was not found.
     pub async fn close(&self, id: u32, reason: CloseReason) -> Result<bool, SourceError> {
-        let removed = self.inner.notifications.write().await.remove(&id);
+        let removed = self
+            .inner
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned")
+            .remove(&id);
         if removed.is_none() {
             return Ok(false);
         }
@@ -233,21 +242,32 @@ impl WispSource {
     /// On success, emits `ActionInvoked` and then closes the notification as dismissed.
     /// Returns `Ok(false)` if notification or action key is not found.
     pub async fn invoke_action(&self, id: u32, action_key: &str) -> Result<bool, SourceError> {
-        let mut store = self.inner.notifications.write().await;
-        let Some(stored) = store.remove(&id) else {
-            return Ok(false);
+        let action_exists = {
+            let mut store = self
+                .inner
+                .notifications
+                .lock()
+                .expect("notifications mutex poisoned");
+            let Some(stored) = store.remove(&id) else {
+                return Ok(false);
+            };
+
+            if !stored
+                .notification
+                .actions
+                .iter()
+                .any(|a| a.key == action_key)
+            {
+                store.insert(id, stored);
+                false
+            } else {
+                true
+            }
         };
 
-        if !stored
-            .notification
-            .actions
-            .iter()
-            .any(|a| a.key == action_key)
-        {
-            store.insert(id, stored);
+        if !action_exists {
             return Ok(false);
         }
-        drop(store);
 
         self.send_event(NotificationEvent::ActionInvoked {
             id,
@@ -261,7 +281,11 @@ impl WispSource {
 
     /// Returns a snapshot of current notifications keyed by id.
     pub async fn snapshot(&self) -> Vec<(u32, Notification)> {
-        let store = self.inner.notifications.read().await;
+        let store = self
+            .inner
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned");
         store
             .iter()
             .map(|(id, stored)| (*id, stored.notification.clone()))
@@ -287,6 +311,9 @@ impl WispSource {
             return;
         };
 
+        // NOTE: We observed `Notify` hanging in some runs and suspected timeout spawning as one
+        // possible trigger when no current Tokio context is available here. This diagnosis is not
+        // fully proven, but guarding with `try_current` keeps this path non-panicking/fallible.
         let Ok(handle) = Handle::try_current() else {
             warn!(
                 id,
@@ -320,17 +347,27 @@ impl WispSource {
     }
 
     async fn expire_if_current(&self, id: u32, generation: u64) -> Result<(), SourceError> {
-        let mut store = self.inner.notifications.write().await;
-        let should_expire = store
-            .get(&id)
-            .is_some_and(|entry| entry.generation == generation);
+        let removed = {
+            let mut store = self
+                .inner
+                .notifications
+                .lock()
+                .expect("notifications mutex poisoned");
 
-        if !should_expire {
+            let should_expire = store
+                .get(&id)
+                .is_some_and(|entry| entry.generation == generation);
+
+            if !should_expire {
+                return Ok(());
+            }
+
+            store.remove(&id)
+        };
+
+        if removed.is_none() {
             return Ok(());
         }
-
-        store.remove(&id);
-        drop(store);
 
         self.send_closed(id, CloseReason::Expired).await
     }
