@@ -219,6 +219,13 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
     Task::none()
 }
 
+fn app_style(_state: &WispdUi, theme: &iced::Theme) -> iced::theme::Style {
+    iced::theme::Style {
+        background_color: Color::TRANSPARENT,
+        text_color: theme.palette().text,
+    }
+}
+
 fn view(state: &WispdUi) -> Element<'_, Message> {
     let mut stack = column![].spacing(state.ui.gap as u32).width(Length::Shrink);
 
@@ -457,6 +464,7 @@ fn main() -> Result<()> {
         update,
         view,
     )
+    .style(app_style)
     .subscription(subscription)
     .settings(settings);
 
