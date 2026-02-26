@@ -450,9 +450,9 @@ fn main() -> Result<()> {
                 app_cfg.ui.margin.bottom,
                 app_cfg.ui.margin.left,
             ),
-            // NOTE: wlroots layer-shell expects valid non-zero dimensions for this anchor setup.
-            // A zero height here can trigger protocol error 1 on some compositors.
-            size: Some((app_cfg.ui.width, app_cfg.ui.height.max(1))),
+            // Let layer-shell pick a content-driven size to avoid a large opaque/black backing surface.
+            // (Explicit size with some compositor/renderer combinations can look like one big panel.)
+            size: None,
             ..Default::default()
         },
         ..Default::default()
