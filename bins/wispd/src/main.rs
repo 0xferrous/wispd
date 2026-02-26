@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
@@ -209,7 +209,12 @@ fn main() -> Result<()> {
     .subscription(subscription)
     .settings(settings);
 
-    match catch_unwind(AssertUnwindSafe(|| app.run())) {
+    let default_hook = take_hook();
+    set_hook(Box::new(|_| {}));
+    let run_result = catch_unwind(AssertUnwindSafe(|| app.run()));
+    set_hook(default_hook);
+
+    match run_result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(anyhow::anyhow!("failed to run iced layer-shell app: {err}")),
         Err(_) => Err(anyhow::anyhow!(
