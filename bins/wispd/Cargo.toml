@@ -8,7 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 iced = { version = "0.14.0", features = ["tokio"] }
 iced_layershell = "0.15.0"
+serde.workspace = true
 tokio.workspace = true
+toml = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wisp-source = { path = "../../crates/wisp-source" }

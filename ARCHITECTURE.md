@@ -96,13 +96,25 @@ Event transport is currently `tokio::mpsc` (single consumer stream per source in
 
 ## 6) Config surface (current)
 
-`SourceConfig` currently includes:
+Config file is loaded from:
+- `$XDG_CONFIG_HOME/wispd/config.toml`
+- fallback: `~/.config/wispd/config.toml`
 
-- capabilities list (reported by `GetCapabilities`)
-- event channel capacity
-- D-Bus name/path
-- server information strings for `GetServerInformation`
-- `default_timeout_ms` (used when client sends negative timeout)
+`source` config currently supports:
+- `capabilities` list (reported by `GetCapabilities`)
+- `default_timeout_ms` (used when incoming timeout is negative)
+  - if unset, negative incoming timeouts are treated as persistent
+
+`ui` config currently supports:
+- `format` string with placeholders (`{id}`, `{app_name}`, `{summary}`, `{body}`, `{urgency}`)
+- `max_visible`
+- `width`
+- `gap`
+- `padding`
+- `font_size`
+- `anchor`
+- `margin` (`top`, `right`, `bottom`, `left`)
+- urgency colors (`low`, `normal`, `critical`) plus base `background` and `text`
 
 ## 7) Testing status
 

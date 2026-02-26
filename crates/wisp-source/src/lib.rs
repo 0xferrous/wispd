@@ -44,7 +44,9 @@ pub struct SourceConfig {
     /// Spec version returned by `GetServerInformation`.
     pub spec_version: String,
     /// Default timeout used when incoming timeout is negative.
-    pub default_timeout_ms: i32,
+    ///
+    /// If `None`, negative incoming timeout values are treated as persistent.
+    pub default_timeout_ms: Option<i32>,
 }
 
 impl Default for SourceConfig {
@@ -58,7 +60,7 @@ impl Default for SourceConfig {
             server_vendor: "wispd".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             spec_version: "1.2".to_string(),
-            default_timeout_ms: 5_000,
+            default_timeout_ms: None,
         }
     }
 }
@@ -334,7 +336,7 @@ impl WispSource {
     fn effective_timeout_duration(&self, requested_timeout_ms: i32) -> Option<Duration> {
         let effective_ms = match requested_timeout_ms {
             0 => return None,
-            x if x < 0 => self.inner.cfg.default_timeout_ms,
+            x if x < 0 => self.inner.cfg.default_timeout_ms?,
             x => x,
         };
 
@@ -640,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_emits_closed_expired_event() {
         let cfg = SourceConfig {
-            default_timeout_ms: 20,
+            default_timeout_ms: Some(20),
             ..SourceConfig::default()
         };
         let (source, mut rx) = WispSource::new(cfg);

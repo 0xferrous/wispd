@@ -1,20 +1,118 @@
 use std::{
     collections::VecDeque,
+    fs,
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
 use anyhow::{Result, anyhow};
 use iced::widget::{column, container, text};
-use iced::{Element, Length, Subscription, Task};
+use iced::{Background, Color, Element, Length, Subscription, Task, border};
 use iced_layershell::application;
 use iced_layershell::reexport::{Anchor, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
+use serde::Deserialize;
 use tracing::{info, warn};
 use wisp_source::{SourceConfig, WispSource};
 use wisp_types::{Notification, NotificationEvent, Urgency};
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct AppConfig {
+    source: SourceSection,
+    ui: UiSection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct SourceSection {
+    default_timeout_ms: Option<i32>,
+    capabilities: Vec<String>,
+}
+
+impl Default for SourceSection {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: None,
+            capabilities: vec!["body".to_string()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct UiSection {
+    format: String,
+    max_visible: usize,
+    width: u32,
+    gap: u16,
+    padding: u16,
+    font_size: u16,
+    anchor: String,
+    margin: MarginConfig,
+    colors: UrgencyColors,
+}
+
+impl Default for UiSection {
+    fn default() -> Self {
+        Self {
+            format: "{app_name}: {summary}\n{body}".to_string(),
+            max_visible: 5,
+            width: 420,
+            gap: 8,
+            padding: 10,
+            font_size: 15,
+            anchor: "top-right".to_string(),
+            margin: MarginConfig::default(),
+            colors: UrgencyColors::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct MarginConfig {
+    top: i32,
+    right: i32,
+    bottom: i32,
+    left: i32,
+}
+
+impl Default for MarginConfig {
+    fn default() -> Self {
+        Self {
+            top: 16,
+            right: 16,
+            bottom: 16,
+            left: 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct UrgencyColors {
+    low: String,
+    normal: String,
+    critical: String,
+    background: String,
+    text: String,
+}
+
+impl Default for UrgencyColors {
+    fn default() -> Self {
+        Self {
+            low: "#6aa9ff".to_string(),
+            normal: "#7dcf7d".to_string(),
+            critical: "#ff6b6b".to_string(),
+            background: "#1e1e2ecc".to_string(),
+            text: "#f8f8f2".to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct UiNotification {
@@ -29,15 +127,15 @@ struct UiNotification {
 struct WispdUi {
     events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
     notifications: VecDeque<UiNotification>,
-    max_visible: usize,
+    ui: UiSection,
 }
 
 impl WispdUi {
-    fn new(events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>) -> Self {
+    fn new(events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>, ui: UiSection) -> Self {
         Self {
             events,
             notifications: VecDeque::new(),
-            max_visible: 5,
+            ui,
         }
     }
 
@@ -91,7 +189,7 @@ impl WispdUi {
     fn insert_new(&mut self, id: u32, notification: Notification) {
         self.notifications
             .push_front(to_ui_notification(id, notification));
-        while self.notifications.len() > self.max_visible {
+        while self.notifications.len() > self.ui.max_visible {
             let _ = self.notifications.pop_back();
         }
     }
@@ -120,32 +218,32 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
 }
 
 fn view(state: &WispdUi) -> Element<'_, Message> {
-    let mut content = column![].spacing(8).padding(12).width(Length::Fill);
+    let mut stack = column![].spacing(state.ui.gap as u32).width(Length::Shrink);
 
-    if state.notifications.is_empty() {
-        content = content.push(text("wispd is running…").size(16));
-        content = content.push(text("waiting for notifications").size(14));
-    } else {
-        for n in &state.notifications {
-            let urgency = match n.urgency {
-                Urgency::Low => "low",
-                Urgency::Normal => "normal",
-                Urgency::Critical => "critical",
-            };
+    for n in &state.notifications {
+        let formatted = render_format(&state.ui.format, n);
+        let border_color = urgency_color(&state.ui.colors, n.urgency.clone());
+        let bg_color = parse_hex_color(&state.ui.colors.background)
+            .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
+        let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
+        let card_width = state.ui.width as f32;
+        let card_padding = state.ui.padding;
+        let font_size = state.ui.font_size as u32;
 
-            let card = column![
-                text(format!("#{} [{}] {}", n.id, urgency, n.app_name)).size(13),
-                text(n.summary.clone()).size(18),
-                text(n.body.clone()).size(14),
-            ]
-            .spacing(4)
-            .padding(10);
+        let card = container(text(formatted).size(font_size))
+            .padding(card_padding)
+            .width(Length::Fixed(card_width))
+            .style(move |_| {
+                iced::widget::container::Style::default()
+                    .background(Background::Color(bg_color))
+                    .color(text_color)
+                    .border(border::width(2).color(border_color).rounded(10))
+            });
 
-            content = content.push(container(card));
-        }
+        stack = stack.push(card);
     }
 
-    container(content).width(Length::Fill).into()
+    container(stack).width(Length::Shrink).into()
 }
 
 fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
@@ -158,8 +256,117 @@ fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
     }
 }
 
+fn render_format(format: &str, n: &UiNotification) -> String {
+    format
+        .replace("{id}", &n.id.to_string())
+        .replace("{app_name}", &n.app_name)
+        .replace("{summary}", &n.summary)
+        .replace("{body}", &n.body)
+        .replace("{urgency}", urgency_label(n.urgency.clone()))
+}
+
+fn urgency_label(urgency: Urgency) -> &'static str {
+    match urgency {
+        Urgency::Low => "low",
+        Urgency::Normal => "normal",
+        Urgency::Critical => "critical",
+    }
+}
+
+fn urgency_color(colors: &UrgencyColors, urgency: Urgency) -> Color {
+    let fallback = match urgency {
+        Urgency::Low => Color::from_rgb(0.42, 0.66, 1.0),
+        Urgency::Normal => Color::from_rgb(0.49, 0.81, 0.49),
+        Urgency::Critical => Color::from_rgb(1.0, 0.42, 0.42),
+    };
+
+    let selected = match urgency {
+        Urgency::Low => &colors.low,
+        Urgency::Normal => &colors.normal,
+        Urgency::Critical => &colors.critical,
+    };
+
+    parse_hex_color(selected).unwrap_or(fallback)
+}
+
+fn parse_hex_color(raw: &str) -> Option<Color> {
+    let hex = raw.trim().trim_start_matches('#');
+    match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(Color::from_rgb8(r, g, b))
+        }
+        8 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&hex[6..8], 16).ok()?;
+            Some(Color::from_rgba8(r, g, b, a as f32 / 255.0))
+        }
+        _ => None,
+    }
+}
+
+fn layer_anchor_from_str(anchor: &str) -> Anchor {
+    match anchor {
+        "top-left" => Anchor::Top | Anchor::Left,
+        "top-right" => Anchor::Top | Anchor::Right,
+        "bottom-left" => Anchor::Bottom | Anchor::Left,
+        "bottom-right" => Anchor::Bottom | Anchor::Right,
+        "top" => Anchor::Top,
+        "bottom" => Anchor::Bottom,
+        "left" => Anchor::Left,
+        "right" => Anchor::Right,
+        _ => Anchor::Top | Anchor::Right,
+    }
+}
+
+fn config_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                let mut p = PathBuf::from(home);
+                p.push(".config");
+                p
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    base.join("wispd").join("config.toml")
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        info!(path = %path.display(), "config not found, using defaults");
+        return AppConfig::default();
+    };
+
+    match toml::from_str::<AppConfig>(&raw) {
+        Ok(cfg) => {
+            info!(path = %path.display(), "loaded config");
+            cfg
+        }
+        Err(err) => {
+            warn!(path = %path.display(), %err, "failed to parse config, using defaults");
+            AppConfig::default()
+        }
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    let app_cfg = load_config();
+
+    let source_cfg = SourceConfig {
+        default_timeout_ms: app_cfg.source.default_timeout_ms,
+        capabilities: app_cfg.source.capabilities.clone(),
+        ..SourceConfig::default()
+    };
 
     let (ui_tx, ui_rx) = mpsc::channel::<NotificationEvent>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<SourceConfig, String>>();
@@ -181,9 +388,8 @@ fn main() -> Result<()> {
 
             runtime.block_on(async move {
                 info!("source thread runtime started");
-                let cfg = SourceConfig::default();
                 let (source_handle, mut source_events, dbus_service) =
-                    match WispSource::start_dbus(cfg.clone()).await {
+                    match WispSource::start_dbus(source_cfg.clone()).await {
                         Ok(parts) => parts,
                         Err(err) => {
                             let _ = ready_tx
@@ -192,8 +398,8 @@ fn main() -> Result<()> {
                         }
                     };
 
-                info!(dbus_name = %cfg.dbus_name, "source thread dbus initialized");
-                let _ = ready_tx.send(Ok(cfg));
+                info!(dbus_name = %source_cfg.dbus_name, "source thread dbus initialized");
+                let _ = ready_tx.send(Ok(source_cfg.clone()));
 
                 while let Some(event) = source_events.recv().await {
                     if ui_tx.send(event).is_err() {
@@ -208,35 +414,41 @@ fn main() -> Result<()> {
         })
         .map_err(|err| anyhow!("failed to spawn source thread: {err}"))?;
 
-    let cfg = match ready_rx.recv_timeout(Duration::from_secs(3)) {
+    let source_runtime_cfg = match ready_rx.recv_timeout(Duration::from_secs(3)) {
         Ok(Ok(cfg)) => cfg,
         Ok(Err(err)) => return Err(anyhow!(err)),
         Err(err) => return Err(anyhow!("source thread did not initialize in time: {err}")),
     };
 
     info!(
-        dbus_name = %cfg.dbus_name,
-        dbus_path = %cfg.dbus_path,
+        dbus_name = %source_runtime_cfg.dbus_name,
+        dbus_path = %source_runtime_cfg.dbus_path,
         "wispd ui started"
     );
 
     let events = Arc::new(Mutex::new(ui_rx));
     let boot_events = Arc::clone(&events);
+    let ui_cfg = app_cfg.ui.clone();
 
     let settings = Settings {
         layer_settings: LayerShellSettings {
-            anchor: Anchor::Top | Anchor::Right,
+            anchor: layer_anchor_from_str(&app_cfg.ui.anchor),
             layer: Layer::Overlay,
             exclusive_zone: 0,
-            margin: (16, 16, 16, 16),
-            size: Some((420, 300)),
+            margin: (
+                app_cfg.ui.margin.top,
+                app_cfg.ui.margin.right,
+                app_cfg.ui.margin.bottom,
+                app_cfg.ui.margin.left,
+            ),
+            size: Some((app_cfg.ui.width, 0)),
             ..Default::default()
         },
         ..Default::default()
     };
 
     let app = application(
-        move || WispdUi::new(Arc::clone(&boot_events)),
+        move || WispdUi::new(Arc::clone(&boot_events), ui_cfg.clone()),
         namespace,
         update,
         view,
@@ -251,8 +463,8 @@ fn main() -> Result<()> {
 
     match run_result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(anyhow::anyhow!("failed to run iced layer-shell app: {err}")),
-        Err(_) => Err(anyhow::anyhow!(
+        Ok(Err(err)) => Err(anyhow!("failed to run iced layer-shell app: {err}")),
+        Err(_) => Err(anyhow!(
             "wispd ui panicked while creating layer-shell window. Make sure you are running inside a Wayland session and have Wayland runtime libraries available (e.g. `wayland`, `libxkbcommon`)."
         )),
     }
@@ -282,7 +494,7 @@ mod tests {
     #[test]
     fn newest_goes_to_front() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)));
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
         ui.apply_event(sample(1, "one"));
         ui.apply_event(sample(2, "two"));
@@ -294,7 +506,7 @@ mod tests {
     #[test]
     fn replacement_keeps_slot() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)));
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
         ui.apply_event(sample(1, "one"));
         ui.apply_event(sample(2, "two"));
@@ -314,7 +526,7 @@ mod tests {
     #[test]
     fn close_removes_notification() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)));
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
 
         ui.apply_event(sample(1, "one"));
         ui.apply_event(NotificationEvent::Closed {
@@ -323,5 +535,19 @@ mod tests {
         });
 
         assert!(ui.notifications.is_empty());
+    }
+
+    #[test]
+    fn format_string_substitutes_placeholders() {
+        let n = UiNotification {
+            id: 9,
+            app_name: "mail".to_string(),
+            summary: "new message".to_string(),
+            body: "hello".to_string(),
+            urgency: Urgency::Critical,
+        };
+
+        let rendered = render_format("{id} {app_name} {summary} {body} {urgency}", &n);
+        assert_eq!(rendered, "9 mail new message hello critical");
     }
 }
