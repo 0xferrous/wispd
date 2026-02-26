@@ -106,6 +106,8 @@ Implemented tests in `wisp-source`:
 - D-Bus integration tests (skip when session bus unavailable):
   - `Notify` emits received event (including parsed icon/hints)
   - `CloseNotification` emits closed event with `ClosedByCall`
+  - `NotificationClosed` signal is emitted with expected reason code
+  - `ActionInvoked` signal is emitted for action invocation
   - `GetCapabilities` returns configured capabilities
   - `GetServerInformation` returns configured values
 

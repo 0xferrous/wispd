@@ -10,3 +10,6 @@ tokio.workspace = true
 tracing.workspace = true
 wisp-types = { path = "../wisp-types" }
 zbus.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"

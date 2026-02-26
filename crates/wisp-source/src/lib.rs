@@ -513,6 +513,8 @@ fn close_reason_code(reason: CloseReason) -> u32 {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use futures_util::StreamExt;
+
     use super::*;
 
     fn test_notification(summary: &str) -> Notification {
@@ -696,6 +698,19 @@ mod tests {
         Some((cfg, source, rx, service, client))
     }
 
+    async fn make_notifications_proxy<'a>(
+        client: &'a zbus::Connection,
+        cfg: &'a SourceConfig,
+    ) -> zbus::Result<zbus::Proxy<'a>> {
+        zbus::Proxy::new(
+            client,
+            cfg.dbus_name.as_str(),
+            cfg.dbus_path.as_str(),
+            DBUS_INTERFACE,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn dbus_notify_emits_received_event() {
         let Some((cfg, _source, mut rx, _service, client)) =
@@ -820,6 +835,104 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dbus_close_notification_emits_notification_closed_signal() {
+        let Some((cfg, _source, mut rx, _service, client)) =
+            setup_dbus_source_for_test("CloseSignal").await
+        else {
+            return;
+        };
+
+        let proxy = make_notifications_proxy(&client, &cfg).await.unwrap();
+        let mut closed_stream = proxy.receive_signal("NotificationClosed").await.unwrap();
+
+        let notify_msg = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "Notify",
+                &(
+                    String::from("test-client"),
+                    0_u32,
+                    String::new(),
+                    String::from("hello"),
+                    String::from("world"),
+                    Vec::<String>::new(),
+                    HashMap::<String, zvariant::OwnedValue>::new(),
+                    10_000_i32,
+                ),
+            )
+            .await
+            .unwrap();
+        let id: u32 = notify_msg.body().deserialize().unwrap();
+        let _ = rx.recv().await;
+
+        client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "CloseNotification",
+                &(id),
+            )
+            .await
+            .unwrap();
+
+        let signal = tokio::time::timeout(Duration::from_secs(2), closed_stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let (signal_id, reason_code): (u32, u32) = signal.body().deserialize().unwrap();
+        assert_eq!(signal_id, id);
+        assert_eq!(reason_code, 3);
+    }
+
+    #[tokio::test]
+    async fn invoke_action_emits_action_invoked_signal() {
+        let Some((cfg, source, mut rx, _service, client)) =
+            setup_dbus_source_for_test("ActionSignal").await
+        else {
+            return;
+        };
+
+        let proxy = make_notifications_proxy(&client, &cfg).await.unwrap();
+        let mut action_stream = proxy.receive_signal("ActionInvoked").await.unwrap();
+
+        let notify_msg = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "Notify",
+                &(
+                    String::from("test-client"),
+                    0_u32,
+                    String::new(),
+                    String::from("hello"),
+                    String::from("world"),
+                    vec![String::from("open"), String::from("Open")],
+                    HashMap::<String, zvariant::OwnedValue>::new(),
+                    10_000_i32,
+                ),
+            )
+            .await
+            .unwrap();
+        let id: u32 = notify_msg.body().deserialize().unwrap();
+        let _ = rx.recv().await;
+
+        let invoked = source.invoke_action(id, "open").await.unwrap();
+        assert!(invoked);
+
+        let signal = tokio::time::timeout(Duration::from_secs(2), action_stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let (signal_id, action_key): (u32, String) = signal.body().deserialize().unwrap();
+        assert_eq!(signal_id, id);
+        assert_eq!(action_key, "open");
     }
 
     #[tokio::test]
