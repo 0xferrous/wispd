@@ -59,6 +59,7 @@ TOML-configurable:
 - urgency colors (`low`, `normal`, `critical`)
 - per-notification padding
 - font size
+- font family
 
 ## 6. Reliability expectations
 

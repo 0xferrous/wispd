@@ -113,6 +113,7 @@ Config file is loaded from:
 - `gap`
 - `padding`
 - `font_size`
+- `font_family`
 - `anchor`
 - `margin` (`top`, `right`, `bottom`, `left`)
 - urgency colors (`low`, `normal`, `critical`) plus base `background` and `text`

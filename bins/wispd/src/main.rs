@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use iced::widget::{column, container, text};
-use iced::{Background, Color, Element, Length, Subscription, Task, border};
+use iced::{Background, Color, Element, Font, Length, Subscription, Task, border};
 use iced_layershell::daemon;
 use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings};
 use iced_layershell::settings::{LayerShellSettings, Settings};
@@ -52,6 +52,7 @@ struct UiSection {
     gap: u16,
     padding: u16,
     font_size: u16,
+    font_family: String,
     anchor: String,
     margin: MarginConfig,
     colors: UrgencyColors,
@@ -67,6 +68,7 @@ impl Default for UiSection {
             gap: 8,
             padding: 10,
             font_size: 15,
+            font_family: "sans-serif".to_string(),
             anchor: "top-right".to_string(),
             margin: MarginConfig::default(),
             colors: UrgencyColors::default(),
@@ -352,7 +354,9 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     let card_padding = state.ui.padding;
     let font_size = state.ui.font_size as u32;
 
-    let card = container(text(formatted).size(font_size))
+    let font = resolve_font(&state.ui.font_family);
+
+    let card = container(text(formatted).size(font_size).font(font))
         .padding(card_padding)
         .width(Length::Fixed(card_width))
         .height(Length::Fixed(card_height))
@@ -360,7 +364,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
             iced::widget::container::Style::default()
                 .background(Background::Color(bg_color))
                 .color(text_color)
-                .border(border::width(2).color(border_color).rounded(10))
+                .border(border::width(2).color(border_color))
         });
 
     container(column![card])
@@ -446,6 +450,29 @@ fn wrapped_line_count(line: &str, max_chars: usize) -> usize {
     }
 
     lines
+}
+
+fn resolve_font(raw: &str) -> Font {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "sans" | "sans-serif" => Font::DEFAULT,
+        "serif" => Font {
+            family: iced::font::Family::Serif,
+            ..Font::DEFAULT
+        },
+        "monospace" | "mono" => Font::MONOSPACE,
+        "cursive" => Font {
+            family: iced::font::Family::Cursive,
+            ..Font::DEFAULT
+        },
+        "fantasy" => Font {
+            family: iced::font::Family::Fantasy,
+            ..Font::DEFAULT
+        },
+        custom => {
+            let leaked: &'static str = Box::leak(custom.to_string().into_boxed_str());
+            Font::with_name(leaked)
+        }
+    }
 }
 
 fn urgency_label(urgency: Urgency) -> &'static str {
