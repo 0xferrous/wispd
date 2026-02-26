@@ -123,4 +123,12 @@ In another terminal:
 notify-send "hello" "from notify-send"
 ```
 
+`wisp-debug` also accepts stdin commands:
+
+- `list`
+- `close <id>`
+- `action <id> <action-key>`
+- `help`
+- `quit`
+
 If startup fails with "name already taken on the bus", stop the currently running notification daemon first.
