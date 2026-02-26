@@ -8,6 +8,7 @@ use std::{
 };
 
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
@@ -286,8 +287,16 @@ impl WispSource {
             return;
         };
 
+        let Ok(handle) = Handle::try_current() else {
+            warn!(
+                id,
+                "no tokio runtime context available; skipping timeout scheduling"
+            );
+            return;
+        };
+
         let source = self.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             tokio::time::sleep(duration).await;
             if let Err(err) = source.expire_if_current(id, generation).await {
                 warn!(id, ?err, "failed to process timeout expiration");
