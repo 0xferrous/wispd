@@ -8,16 +8,17 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use iced::widget::{column, container, text};
+use iced::widget::{button, column, container, row, text};
 use iced::{Background, Color, Element, Font, Length, Subscription, Task, border};
 use iced_layershell::daemon;
 use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use serde::Deserialize;
+use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{info, warn};
 use wisp_source::{SourceConfig, WispSource};
-use wisp_types::{Notification, NotificationEvent, Urgency};
+use wisp_types::{Notification, NotificationAction, NotificationEvent, Urgency};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -119,12 +120,19 @@ impl Default for UrgencyColors {
 }
 
 #[derive(Debug, Clone)]
+struct UiAction {
+    key: String,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
 struct UiNotification {
     id: u32,
     app_name: String,
     summary: String,
     body: String,
     urgency: Urgency,
+    actions: Vec<UiAction>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,18 +141,29 @@ struct WindowBinding {
     notification_id: u32,
 }
 
+#[derive(Debug, Clone)]
+enum SourceCommand {
+    InvokeAction { id: u32, key: String },
+}
+
 #[derive(Debug)]
 struct WispdUi {
     events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
+    cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
     notifications: HashMap<u32, UiNotification>,
     windows: VecDeque<WindowBinding>,
     ui: UiSection,
 }
 
 impl WispdUi {
-    fn new(events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>, ui: UiSection) -> Self {
+    fn new(
+        events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
+        cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
+        ui: UiSection,
+    ) -> Self {
         Self {
             events,
+            cmd_tx,
             notifications: HashMap::new(),
             windows: VecDeque::new(),
             ui,
@@ -297,6 +316,7 @@ impl WispdUi {
 #[derive(Debug, Clone)]
 enum Message {
     Tick,
+    ActionClicked { id: u32, key: String },
 }
 
 fn namespace() -> String {
@@ -310,6 +330,12 @@ fn subscription(_: &WispdUi) -> Subscription<Message> {
 fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
     match message {
         Message::Tick => state.on_tick(),
+        Message::ActionClicked { id, key } => {
+            if let Err(err) = state.cmd_tx.send(SourceCommand::InvokeAction { id, key }) {
+                warn!(?err, "failed to send action command to source thread");
+            }
+            Task::none()
+        }
         _ => Task::none(),
     }
 }
@@ -356,7 +382,22 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
 
     let font = resolve_font(&state.ui.font_family);
 
-    let card = container(text(formatted).size(font_size).font(font))
+    let mut card_content = column![text(formatted).size(font_size).font(font)].spacing(8);
+
+    if !n.actions.is_empty() {
+        let mut actions_row = row![].spacing(8);
+        for action in &n.actions {
+            actions_row = actions_row.push(button(text(action.label.clone())).on_press(
+                Message::ActionClicked {
+                    id: n.id,
+                    key: action.key.clone(),
+                },
+            ));
+        }
+        card_content = card_content.push(actions_row);
+    }
+
+    let card = container(card_content)
         .padding(card_padding)
         .width(Length::Fixed(card_width))
         .height(Length::Fixed(card_height))
@@ -383,6 +424,14 @@ fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
         summary: notification.summary,
         body: notification.body,
         urgency: notification.urgency,
+        actions: notification.actions.into_iter().map(to_ui_action).collect(),
+    }
+}
+
+fn to_ui_action(action: NotificationAction) -> UiAction {
+    UiAction {
+        key: action.key,
+        label: action.label,
     }
 }
 
@@ -579,6 +628,7 @@ fn main() -> Result<()> {
     };
 
     let (ui_tx, ui_rx) = mpsc::channel::<NotificationEvent>();
+    let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<SourceCommand>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<SourceConfig, String>>();
 
     std::thread::Builder::new()
@@ -611,10 +661,32 @@ fn main() -> Result<()> {
                 info!(dbus_name = %source_cfg.dbus_name, "source thread dbus initialized");
                 let _ = ready_tx.send(Ok(source_cfg.clone()));
 
-                while let Some(event) = source_events.recv().await {
-                    if ui_tx.send(event).is_err() {
-                        warn!("ui channel receiver dropped; stopping source forwarder");
-                        break;
+                loop {
+                    tokio::select! {
+                        maybe_event = source_events.recv() => {
+                            let Some(event) = maybe_event else {
+                                info!("source events channel ended");
+                                break;
+                            };
+                            if ui_tx.send(event).is_err() {
+                                warn!("ui channel receiver dropped; stopping source forwarder");
+                                break;
+                            }
+                        }
+                        maybe_cmd = cmd_rx.recv() => {
+                            let Some(cmd) = maybe_cmd else {
+                                info!("source command channel ended");
+                                break;
+                            };
+                            match cmd {
+                                SourceCommand::InvokeAction { id, key } => {
+                                    match source_handle.invoke_action(id, &key).await {
+                                        Ok(invoked) => info!(id, action_key = %key, invoked, "action command processed"),
+                                        Err(err) => warn!(id, action_key = %key, ?err, "failed to process action command"),
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -639,6 +711,7 @@ fn main() -> Result<()> {
     let events = Arc::new(Mutex::new(ui_rx));
     let boot_events = Arc::clone(&events);
     let ui_cfg = app_cfg.ui.clone();
+    let boot_cmd_tx = cmd_tx.clone();
 
     let settings = Settings {
         layer_settings: LayerShellSettings {
@@ -654,7 +727,13 @@ fn main() -> Result<()> {
     };
 
     let app = daemon(
-        move || WispdUi::new(Arc::clone(&boot_events), ui_cfg.clone()),
+        move || {
+            WispdUi::new(
+                Arc::clone(&boot_events),
+                boot_cmd_tx.clone(),
+                ui_cfg.clone(),
+            )
+        },
         namespace,
         update,
         view,
@@ -701,7 +780,8 @@ mod tests {
     #[test]
     fn newest_goes_to_front() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
+        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -714,7 +794,8 @@ mod tests {
     #[test]
     fn replacement_keeps_slot() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
+        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -734,7 +815,8 @@ mod tests {
     #[test]
     fn close_removes_notification() {
         let (_tx, rx) = mpsc::channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), UiSection::default());
+        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(NotificationEvent::Closed {
@@ -753,6 +835,7 @@ mod tests {
             summary: "new message".to_string(),
             body: "hello".to_string(),
             urgency: Urgency::Critical,
+            actions: vec![],
         };
 
         let rendered = render_format("{id} {app_name} {summary} {body} {urgency}", &n);

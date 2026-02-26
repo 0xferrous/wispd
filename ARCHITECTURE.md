@@ -71,7 +71,7 @@ Implemented now:
 
 Not implemented yet:
 
-- interactive UI controls for actions/closing (current action trigger lives in `wisp-debug` commands)
+- click-to-dismiss behavior in `wispd` UI
 - richer hint coverage (images/sound/etc beyond current parsed subset)
 - polished visual styling/layout behavior expected from mature daemons
 
