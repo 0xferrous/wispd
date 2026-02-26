@@ -37,8 +37,9 @@ bins/
 5. Notification is inserted/replaced in in-memory store.
 6. `wisp-source` schedules timeout expiry (if applicable).
 7. `wisp-source` emits `NotificationEvent` through `tokio::mpsc`.
-8. `wispd` forwards events to its UI thread and applies queue policy (max visible, newest on top, replacement in-place).
-9. `wispd` renders notification popups via `iced` + `iced_layershell`.
+8. `wispd` runs `wisp-source` on a dedicated Tokio runtime thread and forwards events to the UI via a std channel.
+9. `wispd` applies queue policy (max visible, newest on top, replacement in-place).
+10. `wispd` renders notification popups via `iced` + `iced_layershell`.
 
 ## 4) `wisp-source` responsibilities
 

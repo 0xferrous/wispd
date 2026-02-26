@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use iced::widget::{column, container, text};
 use iced::{Element, Length, Subscription, Task};
 use iced_layershell::application;
@@ -161,24 +161,54 @@ fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
-
-    let cfg = SourceConfig::default();
-    let (_source, mut source_events, _dbus) = runtime
-        .block_on(WispSource::start_dbus(cfg.clone()))
-        .context("failed to start wisp source over dbus")?;
-
     let (ui_tx, ui_rx) = mpsc::channel::<NotificationEvent>();
-    runtime.spawn(async move {
-        while let Some(event) = source_events.recv().await {
-            if ui_tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<SourceConfig, String>>();
+
+    std::thread::Builder::new()
+        .name("wispd-source".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("failed to build tokio runtime: {err}")));
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                let cfg = SourceConfig::default();
+                let (source_handle, mut source_events, dbus_service) =
+                    match WispSource::start_dbus(cfg.clone()).await {
+                        Ok(parts) => parts,
+                        Err(err) => {
+                            let _ = ready_tx
+                                .send(Err(format!("failed to start wisp source over dbus: {err}")));
+                            return;
+                        }
+                    };
+
+                let _ = ready_tx.send(Ok(cfg));
+
+                while let Some(event) = source_events.recv().await {
+                    if ui_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+
+                drop((source_handle, dbus_service));
+            });
+        })
+        .map_err(|err| anyhow!("failed to spawn source thread: {err}"))?;
+
+    let cfg = match ready_rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(cfg)) => cfg,
+        Ok(Err(err)) => return Err(anyhow!(err)),
+        Err(err) => return Err(anyhow!("source thread did not initialize in time: {err}")),
+    };
 
     info!(
         dbus_name = %cfg.dbus_name,
