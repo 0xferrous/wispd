@@ -442,7 +442,8 @@ fn main() -> Result<()> {
     let settings = Settings {
         layer_settings: LayerShellSettings {
             anchor: layer_anchor_from_str(&app_cfg.ui.anchor),
-            layer: Layer::Overlay,
+            // Keep this conservative for compositor compatibility.
+            layer: Layer::Top,
             exclusive_zone: 0,
             margin: (
                 app_cfg.ui.margin.top,
@@ -450,9 +451,8 @@ fn main() -> Result<()> {
                 app_cfg.ui.margin.bottom,
                 app_cfg.ui.margin.left,
             ),
-            // Let layer-shell pick a content-driven size to avoid a large opaque/black backing surface.
-            // (Explicit size with some compositor/renderer combinations can look like one big panel.)
-            size: None,
+            // Use explicit non-zero dimensions to avoid zwlr_layer_surface protocol errors.
+            size: Some((app_cfg.ui.width.max(1), app_cfg.ui.height.max(1))),
             ..Default::default()
         },
         ..Default::default()
