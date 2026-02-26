@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -82,7 +89,7 @@ struct Inner {
     cfg: SourceConfig,
     sender: mpsc::Sender<NotificationEvent>,
     notifications: RwLock<HashMap<u32, StoredNotification>>,
-    next_id: RwLock<u32>,
+    next_id: AtomicU32,
     dbus_connection: RwLock<Option<zbus::Connection>>,
 }
 
@@ -114,7 +121,7 @@ impl WispSource {
                 cfg,
                 sender,
                 notifications: RwLock::new(HashMap::new()),
-                next_id: RwLock::new(1),
+                next_id: AtomicU32::new(1),
                 dbus_connection: RwLock::new(None),
             }),
         };
@@ -185,14 +192,10 @@ impl WispSource {
             return Ok(replaces_id);
         }
 
-        drop(store);
-        debug!("allocating notification id");
-        let id = self.alloc_id().await;
+        let id = self.alloc_id();
         debug!(id, "allocated notification id");
 
         let generation = 0;
-        debug!(id, "re-acquiring notifications write lock for insert");
-        let mut store = self.inner.notifications.write().await;
         store.insert(
             id,
             StoredNotification {
@@ -370,11 +373,8 @@ impl WispSource {
         }
     }
 
-    async fn alloc_id(&self) -> u32 {
-        debug!("acquiring next_id write lock");
-        let mut next = self.inner.next_id.write().await;
-        let id = *next;
-        *next = next.saturating_add(1);
+    fn alloc_id(&self) -> u32 {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         debug!(id, "next_id advanced");
         id
     }
