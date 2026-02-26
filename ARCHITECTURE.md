@@ -109,6 +109,7 @@ Config file is loaded from:
 - `format` string with placeholders (`{id}`, `{app_name}`, `{summary}`, `{body}`, `{urgency}`)
 - `max_visible`
 - `width`
+- `height`
 - `gap`
 - `padding`
 - `font_size`

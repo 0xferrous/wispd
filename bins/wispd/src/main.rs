@@ -48,6 +48,7 @@ struct UiSection {
     format: String,
     max_visible: usize,
     width: u32,
+    height: u32,
     gap: u16,
     padding: u16,
     font_size: u16,
@@ -62,6 +63,7 @@ impl Default for UiSection {
             format: "{app_name}: {summary}\n{body}".to_string(),
             max_visible: 5,
             width: 420,
+            height: 420,
             gap: 8,
             padding: 10,
             font_size: 15,
@@ -441,7 +443,9 @@ fn main() -> Result<()> {
                 app_cfg.ui.margin.bottom,
                 app_cfg.ui.margin.left,
             ),
-            size: Some((app_cfg.ui.width, 0)),
+            // NOTE: wlroots layer-shell expects valid non-zero dimensions for this anchor setup.
+            // A zero height here can trigger protocol error 1 on some compositors.
+            size: Some((app_cfg.ui.width, app_cfg.ui.height.max(1))),
             ..Default::default()
         },
         ..Default::default()
