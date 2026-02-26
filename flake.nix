@@ -19,6 +19,8 @@
             clippy
             rust-analyzer
             pkg-config
+            wayland
+            libxkbcommon
           ];
         };
       });

@@ -140,3 +140,5 @@ notify-send "hello" "from notify-send"
 - `quit`
 
 If startup fails with "name already taken on the bus", stop the currently running notification daemon first.
+
+`wispd` requires a Wayland session and Wayland runtime libraries. If you see `NoWaylandLib`, ensure your environment provides `libwayland-client` (in this repo dev shell: `wayland`, `libxkbcommon`).

@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
@@ -199,18 +200,22 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    application(
+    let app = application(
         move || WispdUi::new(Arc::clone(&boot_events)),
         namespace,
         update,
         view,
     )
     .subscription(subscription)
-    .settings(settings)
-    .run()
-    .map_err(|err| anyhow::anyhow!("failed to run iced layer-shell app: {err}"))?;
+    .settings(settings);
 
-    Ok(())
+    match catch_unwind(AssertUnwindSafe(|| app.run())) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(anyhow::anyhow!("failed to run iced layer-shell app: {err}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "wispd ui panicked while creating layer-shell window. Make sure you are running inside a Wayland session and have Wayland runtime libraries available (e.g. `wayland`, `libxkbcommon`)."
+        )),
+    }
 }
 
 #[cfg(test)]
