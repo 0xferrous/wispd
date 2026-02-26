@@ -63,19 +63,21 @@ Implemented now:
 - Declares D-Bus signals:
   - `NotificationClosed`
   - `ActionInvoked`
+- Parses core hints (`urgency`, `category`, `desktop-entry`, `transient`) and preserves unknown hints as debug strings
 - Emits `NotificationClosed` signal for close paths handled by source (`CloseNotification`, timeout expiry, action dismiss)
 - Emits `ActionInvoked` signal when an action is invoked
 
 Not implemented yet:
 
 - wiring UI/input to call `invoke_action`
-- full hints coverage beyond basic urgency parsing
+- richer hint coverage (images/sound/etc beyond current parsed subset)
 
 ## 5) Types and events
 
 Main shared types in `wisp-types`:
 
-- `Notification`
+- `Notification` (includes `app_icon`, `actions`, `hints`)
+- `NotificationHints` (`category`, `desktop_entry`, `transient`, `extra`)
 - `NotificationAction`
 - `Urgency`
 - `CloseReason`
@@ -102,7 +104,7 @@ Implemented tests in `wisp-source`:
 - action invoke emits `ActionInvoked` + `Closed(Dismissed)`
 - unknown action returns false and emits no extra events
 - D-Bus integration tests (skip when session bus unavailable):
-  - `Notify` emits received event
+  - `Notify` emits received event (including parsed icon/hints)
   - `CloseNotification` emits closed event with `ClosedByCall`
   - `GetCapabilities` returns configured capabilities
   - `GetServerInformation` returns configured values

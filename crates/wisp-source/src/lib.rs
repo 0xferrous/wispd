@@ -3,7 +3,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
-use wisp_types::{CloseReason, Notification, NotificationAction, NotificationEvent, Urgency};
+use wisp_types::{
+    CloseReason, Notification, NotificationAction, NotificationEvent, NotificationHints, Urgency,
+};
 use zbus::{connection::Builder as ConnectionBuilder, object_server::SignalEmitter, zvariant};
 
 /// Default freedesktop notification bus name.
@@ -171,8 +173,8 @@ impl WispSource {
             self.schedule_timeout(replaces_id, generation, timeout_ms);
             self.send_event(NotificationEvent::Replaced {
                 id: replaces_id,
-                previous,
-                current: notification,
+                previous: Box::new(previous),
+                current: Box::new(notification),
             })
             .await?;
             return Ok(replaces_id);
@@ -190,8 +192,11 @@ impl WispSource {
         drop(store);
 
         self.schedule_timeout(id, generation, timeout_ms);
-        self.send_event(NotificationEvent::Received { id, notification })
-            .await?;
+        self.send_event(NotificationEvent::Received {
+            id,
+            notification: Box::new(notification),
+        })
+        .await?;
         Ok(id)
     }
 
@@ -384,20 +389,23 @@ impl NotificationsInterface {
         &self,
         app_name: String,
         replaces_id: u32,
-        _app_icon: String,
+        app_icon: String,
         summary: String,
         body: String,
         actions: Vec<String>,
         hints: HashMap<String, zvariant::OwnedValue>,
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
+        let (urgency, parsed_hints) = parse_hints(&hints);
         let notification = Notification {
             app_name,
+            app_icon,
             summary,
             body,
-            urgency: urgency_from_hints(&hints),
+            urgency,
             timeout_ms: expire_timeout,
             actions: parse_actions(actions),
+            hints: parsed_hints,
         };
 
         self.source
@@ -447,16 +455,49 @@ fn parse_actions(flat_actions: Vec<String>) -> Vec<NotificationAction> {
         .collect()
 }
 
-fn urgency_from_hints(hints: &HashMap<String, zvariant::OwnedValue>) -> Urgency {
-    let Some(raw) = hints.get("urgency") else {
-        return Urgency::Normal;
-    };
+fn parse_hints(hints: &HashMap<String, zvariant::OwnedValue>) -> (Urgency, NotificationHints) {
+    let urgency = hints
+        .get("urgency")
+        .and_then(|raw| u8::try_from(raw).ok())
+        .map(|value| match value {
+            0 => Urgency::Low,
+            2 => Urgency::Critical,
+            _ => Urgency::Normal,
+        })
+        .unwrap_or(Urgency::Normal);
 
-    match u8::try_from(raw) {
-        Ok(0) => Urgency::Low,
-        Ok(2) => Urgency::Critical,
-        _ => Urgency::Normal,
-    }
+    let category = hints
+        .get("category")
+        .and_then(|raw| <&str>::try_from(raw).ok())
+        .map(ToOwned::to_owned);
+    let desktop_entry = hints
+        .get("desktop-entry")
+        .and_then(|raw| <&str>::try_from(raw).ok())
+        .map(ToOwned::to_owned);
+    let transient = hints
+        .get("transient")
+        .and_then(|raw| bool::try_from(raw).ok());
+
+    let extra = hints
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() != "urgency"
+                && key.as_str() != "category"
+                && key.as_str() != "desktop-entry"
+                && key.as_str() != "transient"
+        })
+        .map(|(key, value)| (key.clone(), format!("{value:?}")))
+        .collect();
+
+    (
+        urgency,
+        NotificationHints {
+            category,
+            desktop_entry,
+            transient,
+            extra,
+        },
+    )
 }
 
 fn close_reason_code(reason: CloseReason) -> u32 {
@@ -477,17 +518,20 @@ mod tests {
     fn test_notification(summary: &str) -> Notification {
         Notification {
             app_name: "test".into(),
+            app_icon: String::new(),
             summary: summary.into(),
             body: String::new(),
             urgency: Default::default(),
             timeout_ms: -1,
             actions: vec![],
+            hints: NotificationHints::default(),
         }
     }
 
     fn test_notification_with_action(summary: &str, action_key: &str) -> Notification {
         Notification {
             app_name: "test".into(),
+            app_icon: String::new(),
             summary: summary.into(),
             body: String::new(),
             urgency: Default::default(),
@@ -496,6 +540,7 @@ mod tests {
                 key: action_key.to_string(),
                 label: "Test Action".to_string(),
             }],
+            hints: NotificationHints::default(),
         }
     }
 
@@ -659,6 +704,19 @@ mod tests {
             return;
         };
 
+        let mut hints = HashMap::<String, zvariant::OwnedValue>::new();
+        hints.insert("urgency".to_string(), zvariant::OwnedValue::from(2_u8));
+        hints.insert(
+            "category".to_string(),
+            zvariant::OwnedValue::from(zvariant::Str::from("mail.arrived")),
+        );
+        hints.insert(
+            "desktop-entry".to_string(),
+            zvariant::OwnedValue::from(zvariant::Str::from("org.example.Mail")),
+        );
+        hints.insert("transient".to_string(), zvariant::OwnedValue::from(true));
+        hints.insert("x-foo".to_string(), zvariant::OwnedValue::from(42_i32));
+
         let msg = client
             .call_method(
                 Some(cfg.dbus_name.as_str()),
@@ -668,11 +726,11 @@ mod tests {
                 &(
                     String::from("test-client"),
                     0_u32,
-                    String::new(),
+                    String::from("test-icon"),
                     String::from("hello"),
                     String::from("world"),
                     Vec::<String>::new(),
-                    HashMap::<String, zvariant::OwnedValue>::new(),
+                    hints,
                     2_500_i32,
                 ),
             )
@@ -687,7 +745,21 @@ mod tests {
             .unwrap();
 
         match event {
-            NotificationEvent::Received { id: event_id, .. } => assert_eq!(event_id, id),
+            NotificationEvent::Received {
+                id: event_id,
+                notification,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(notification.app_icon, "test-icon");
+                assert_eq!(notification.urgency, Urgency::Critical);
+                assert_eq!(notification.hints.category.as_deref(), Some("mail.arrived"));
+                assert_eq!(
+                    notification.hints.desktop_entry.as_deref(),
+                    Some("org.example.Mail")
+                );
+                assert_eq!(notification.hints.transient, Some(true));
+                assert!(notification.hints.extra.contains_key("x-foo"));
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }

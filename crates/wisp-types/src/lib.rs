@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Notification urgency level as defined by freedesktop notifications.
@@ -34,11 +36,26 @@ pub struct NotificationAction {
     pub label: String,
 }
 
+/// Parsed/normalized hint fields from the freedesktop `hints` map.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NotificationHints {
+    /// Notification category (e.g. `email.arrived`).
+    pub category: Option<String>,
+    /// Desktop entry identifier for matching app metadata.
+    pub desktop_entry: Option<String>,
+    /// Whether this is marked transient by sender.
+    pub transient: Option<bool>,
+    /// Unrecognized hints preserved as debug strings.
+    pub extra: HashMap<String, String>,
+}
+
 /// Normalized notification data used by `wisp` components.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Notification {
     /// Name of the sending application.
     pub app_name: String,
+    /// App icon name/path from sender.
+    pub app_icon: String,
     /// Notification title/summary.
     pub summary: String,
     /// Notification body text.
@@ -49,6 +66,8 @@ pub struct Notification {
     pub timeout_ms: i32,
     /// Declared actions for this notification.
     pub actions: Vec<NotificationAction>,
+    /// Parsed notification hints.
+    pub hints: NotificationHints,
 }
 
 /// Event emitted by the source daemon lifecycle.
@@ -59,7 +78,7 @@ pub enum NotificationEvent {
         /// Notification id allocated by the source.
         id: u32,
         /// Notification payload.
-        notification: Notification,
+        notification: Box<Notification>,
     },
     /// A notification was closed.
     Closed {
@@ -80,8 +99,8 @@ pub enum NotificationEvent {
         /// Notification id that was replaced.
         id: u32,
         /// Previous notification payload.
-        previous: Notification,
+        previous: Box<Notification>,
         /// New notification payload.
-        current: Notification,
+        current: Box<Notification>,
     },
 }
