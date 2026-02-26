@@ -63,7 +63,7 @@ impl Default for UiSection {
             format: "{app_name}: {summary}\n{body}".to_string(),
             max_visible: 5,
             width: 420,
-            height: 140,
+            height: 64,
             gap: 8,
             padding: 10,
             font_size: 15,
@@ -394,23 +394,58 @@ fn render_format(format: &str, n: &UiNotification) -> String {
 fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let rendered = render_format(&ui.format, n);
     let content_width_px = (ui.width as f32 - (ui.padding as f32 * 2.0)).max(80.0);
-    let approx_char_width = (ui.font_size as f32 * 0.56).max(1.0);
+    let approx_char_width = (ui.font_size as f32 * 0.54).max(1.0);
     let chars_per_line = (content_width_px / approx_char_width).floor().max(1.0) as usize;
 
     let wrapped_lines = rendered
         .lines()
-        .map(|line| {
-            let chars = line.chars().count().max(1);
-            chars.div_ceil(chars_per_line)
-        })
+        .map(|line| wrapped_line_count(line, chars_per_line))
         .sum::<usize>()
         .max(1);
 
-    let line_height = (ui.font_size as f32 * 1.35).ceil() as u32;
+    let line_height = (ui.font_size as f32 * 1.30).ceil() as u32;
     let text_height = wrapped_lines as u32 * line_height;
-    let chrome = ui.padding as u32 * 2 + 8;
+    let chrome = ui.padding as u32 * 2 + 6;
 
     text_height.saturating_add(chrome).max(ui.height.max(1))
+}
+
+fn wrapped_line_count(line: &str, max_chars: usize) -> usize {
+    if line.is_empty() {
+        return 1;
+    }
+
+    let mut lines = 1usize;
+    let mut current = 0usize;
+
+    for word in line.split_whitespace() {
+        let word_len = word.chars().count();
+
+        if current == 0 {
+            if word_len <= max_chars {
+                current = word_len;
+            } else {
+                lines += word_len.div_ceil(max_chars).saturating_sub(1);
+                current = word_len % max_chars;
+            }
+            continue;
+        }
+
+        let needed = 1 + word_len;
+        if current + needed <= max_chars {
+            current += needed;
+        } else {
+            lines += 1;
+            if word_len <= max_chars {
+                current = word_len;
+            } else {
+                lines += word_len.div_ceil(max_chars).saturating_sub(1);
+                current = word_len % max_chars;
+            }
+        }
+    }
+
+    lines
 }
 
 fn urgency_label(urgency: Urgency) -> &'static str {
@@ -695,5 +730,15 @@ mod tests {
 
         let rendered = render_format("{id} {app_name} {summary} {body} {urgency}", &n);
         assert_eq!(rendered, "9 mail new message hello critical");
+    }
+
+    #[test]
+    fn wrapped_line_count_wraps_long_words() {
+        assert_eq!(wrapped_line_count("abcdefghij", 4), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_wraps_words_with_spaces() {
+        assert_eq!(wrapped_line_count("one two three four", 7), 3);
     }
 }
