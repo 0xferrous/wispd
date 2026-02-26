@@ -6,7 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+iced = { version = "0.14.0", features = ["tokio"] }
+iced_layershell = "0.15.0"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wisp-source = { path = "../../crates/wisp-source" }
+wisp-types = { path = "../../crates/wisp-types" }

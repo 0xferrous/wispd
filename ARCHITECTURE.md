@@ -24,7 +24,7 @@ crates/
   wisp-source  # D-Bus server + notification store + event stream
 
 bins/
-  wispd        # main daemon entrypoint (currently logs events)
+  wispd        # iced + layer-shell frontend with queue policy + popup rendering
   wisp-debug   # debug daemon entrypoint that logs incoming notifications
 ```
 
@@ -37,7 +37,8 @@ bins/
 5. Notification is inserted/replaced in in-memory store.
 6. `wisp-source` schedules timeout expiry (if applicable).
 7. `wisp-source` emits `NotificationEvent` through `tokio::mpsc`.
-8. Binary receives events and logs them (UI rendering not implemented yet).
+8. `wispd` forwards events to its UI thread and applies queue policy (max visible, newest on top, replacement in-place).
+9. `wispd` renders notification popups via `iced` + `iced_layershell`.
 
 ## 4) `wisp-source` responsibilities
 
@@ -69,8 +70,9 @@ Implemented now:
 
 Not implemented yet:
 
-- wiring UI/input to call `invoke_action`
+- interactive UI controls for actions/closing (current action trigger lives in `wisp-debug` commands)
 - richer hint coverage (images/sound/etc beyond current parsed subset)
+- polished visual styling/layout behavior expected from mature daemons
 
 ## 5) Types and events
 
@@ -84,6 +86,12 @@ Main shared types in `wisp-types`:
 - `NotificationEvent` (`Received`, `Replaced`, `Closed`, `ActionInvoked`)
 
 Event transport is currently `tokio::mpsc` (single consumer stream per source instance).
+
+`wispd` currently applies queue behavior:
+- max visible: 5
+- newest notifications at top
+- replacement updates existing item in-place (keeps slot)
+- close removes item
 
 ## 6) Config surface (current)
 
