@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
 use wisp_types::{
@@ -175,8 +176,7 @@ impl WispSource {
                 id: replaces_id,
                 previous: Box::new(previous),
                 current: Box::new(notification),
-            })
-            .await?;
+            })?;
             return Ok(replaces_id);
         }
 
@@ -195,8 +195,7 @@ impl WispSource {
         self.send_event(NotificationEvent::Received {
             id,
             notification: Box::new(notification),
-        })
-        .await?;
+        })?;
         Ok(id)
     }
 
@@ -237,8 +236,7 @@ impl WispSource {
         self.send_event(NotificationEvent::ActionInvoked {
             id,
             action_key: action_key.to_string(),
-        })
-        .await?;
+        })?;
         self.emit_action_invoked_signal(id, action_key).await;
         self.send_closed(id, CloseReason::Dismissed).await?;
 
@@ -317,8 +315,7 @@ impl WispSource {
         self.send_event(NotificationEvent::Closed {
             id,
             reason: reason.clone(),
-        })
-        .await?;
+        })?;
         self.emit_notification_closed_signal(id, reason).await;
         Ok(())
     }
@@ -368,12 +365,18 @@ impl WispSource {
         id
     }
 
-    async fn send_event(&self, event: NotificationEvent) -> Result<(), SourceError> {
-        if self.inner.sender.send(event).await.is_err() {
-            warn!("event receiver dropped");
-            return Err(SourceError::EventChannelClosed);
+    fn send_event(&self, event: NotificationEvent) -> Result<(), SourceError> {
+        match self.inner.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                warn!("event queue full; dropping notification event");
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => {
+                warn!("event receiver dropped");
+                Err(SourceError::EventChannelClosed)
+            }
         }
-        Ok(())
     }
 }
 
