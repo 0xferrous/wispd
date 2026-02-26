@@ -38,7 +38,7 @@ impl Default for SourceSection {
     fn default() -> Self {
         Self {
             default_timeout_ms: None,
-            capabilities: vec!["body".to_string()],
+            capabilities: vec!["body".to_string(), "actions".to_string()],
         }
     }
 }
@@ -385,16 +385,18 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     let mut card_content = column![text(formatted).size(font_size).font(font)].spacing(8);
 
     if !n.actions.is_empty() {
-        let mut actions_row = row![].spacing(8);
-        for action in &n.actions {
-            actions_row = actions_row.push(button(text(action.label.clone())).on_press(
-                Message::ActionClicked {
-                    id: n.id,
-                    key: action.key.clone(),
-                },
-            ));
+        for action_chunk in n.actions.chunks(3) {
+            let mut actions_row = row![].spacing(8);
+            for action in action_chunk {
+                actions_row = actions_row.push(button(text(action.label.clone())).on_press(
+                    Message::ActionClicked {
+                        id: n.id,
+                        key: action.key.clone(),
+                    },
+                ));
+            }
+            card_content = card_content.push(actions_row);
         }
-        card_content = card_content.push(actions_row);
     }
 
     let card = container(card_content)
@@ -458,9 +460,21 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
 
     let line_height = (ui.font_size as f32 * 1.30).ceil() as u32;
     let text_height = wrapped_lines as u32 * line_height;
+
+    let actions_rows = n.actions.len().div_ceil(3) as u32;
+    let action_row_height = (ui.font_size as f32 * 1.9).ceil() as u32;
+    let actions_height = if actions_rows == 0 {
+        0
+    } else {
+        actions_rows * action_row_height + 8
+    };
+
     let chrome = ui.padding as u32 * 2 + 6;
 
-    text_height.saturating_add(chrome).max(ui.height.max(1))
+    text_height
+        .saturating_add(actions_height)
+        .saturating_add(chrome)
+        .max(ui.height.max(1))
 }
 
 fn wrapped_line_count(line: &str, max_chars: usize) -> usize {
