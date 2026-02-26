@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
-use tracing::warn;
+use tracing::{debug, info, warn};
 use wisp_types::{
     CloseReason, Notification, NotificationAction, NotificationEvent, NotificationHints, Urgency,
 };
@@ -134,12 +134,14 @@ impl WispSource {
             source: source.clone(),
         };
 
+        info!(dbus_name = %cfg.dbus_name, dbus_path = %cfg.dbus_path, "starting dbus notification service");
         let connection = ConnectionBuilder::session()?
             .name(cfg.dbus_name.as_str())?
             .serve_at(cfg.dbus_path.as_str(), iface)?
             .build()
             .await?;
 
+        info!(dbus_name = %cfg.dbus_name, "dbus notification service ready");
         source.set_dbus_connection(connection.clone()).await;
 
         Ok((source, receiver, DbusService { connection }))
@@ -160,6 +162,7 @@ impl WispSource {
         replaces_id: u32,
     ) -> Result<u32, SourceError> {
         let timeout_ms = notification.timeout_ms;
+        debug!(app = %notification.app_name, summary = %notification.summary, replaces_id, timeout_ms, "processing notification");
         let mut store = self.inner.notifications.write().await;
 
         if replaces_id != 0
@@ -177,6 +180,7 @@ impl WispSource {
                 previous: Box::new(previous),
                 current: Box::new(notification),
             })?;
+            debug!(id = replaces_id, "notification replaced");
             return Ok(replaces_id);
         }
 
@@ -196,6 +200,7 @@ impl WispSource {
             id,
             notification: Box::new(notification),
         })?;
+        debug!(id, "notification stored");
         Ok(id)
     }
 
@@ -399,6 +404,7 @@ impl NotificationsInterface {
         hints: HashMap<String, zvariant::OwnedValue>,
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
+        info!(app = %app_name, summary = %summary, replaces_id, expire_timeout, action_pairs = actions.len() / 2, "dbus Notify called");
         let (urgency, parsed_hints) = parse_hints(&hints);
         let notification = Notification {
             app_name,
@@ -411,17 +417,24 @@ impl NotificationsInterface {
             hints: parsed_hints,
         };
 
-        self.source
+        let id = self
+            .source
             .notify(notification, replaces_id)
             .await
-            .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))
+            .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
+
+        info!(id, "dbus Notify handled");
+        Ok(id)
     }
 
     async fn close_notification(&self, id: u32) -> zbus::fdo::Result<()> {
-        self.source
+        info!(id, "dbus CloseNotification called");
+        let closed = self
+            .source
             .close(id, CloseReason::ClosedByCall)
             .await
             .map_err(|err| zbus::fdo::Error::Failed(err.to_string()))?;
+        info!(id, closed, "dbus CloseNotification handled");
         Ok(())
     }
 

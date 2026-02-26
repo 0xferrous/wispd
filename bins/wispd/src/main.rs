@@ -180,6 +180,7 @@ fn main() -> Result<()> {
             };
 
             runtime.block_on(async move {
+                info!("source thread runtime started");
                 let cfg = SourceConfig::default();
                 let (source_handle, mut source_events, dbus_service) =
                     match WispSource::start_dbus(cfg.clone()).await {
@@ -191,14 +192,17 @@ fn main() -> Result<()> {
                         }
                     };
 
+                info!(dbus_name = %cfg.dbus_name, "source thread dbus initialized");
                 let _ = ready_tx.send(Ok(cfg));
 
                 while let Some(event) = source_events.recv().await {
                     if ui_tx.send(event).is_err() {
+                        warn!("ui channel receiver dropped; stopping source forwarder");
                         break;
                     }
                 }
 
+                info!("source thread event forwarder exiting");
                 drop((source_handle, dbus_service));
             });
         })
