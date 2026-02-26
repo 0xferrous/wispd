@@ -2,6 +2,7 @@
 
 - Keep docs concise; avoid verbose planning text.
 - Keep docs up to date with code changes.
+- Make regular commits using Conventional Commits.
 - Focus on `org.freedesktop.Notifications` over D-Bus.
 - No portal integration in v1.
 
