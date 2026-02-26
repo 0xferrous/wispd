@@ -1,0 +1,13 @@
+[package]
+name = "wisp-debug"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wisp-source = { path = "../../crates/wisp-source" }
+wisp-types = { path = "../../crates/wisp-types" }

@@ -2,7 +2,11 @@
 
 - Keep docs concise; avoid verbose planning text.
 - Keep docs up to date with code changes.
+- Keep `ARCHITECTURE.md` updated as a living implementation-oriented doc (especially D-Bus flow and component responsibilities).
 - Make regular commits using Conventional Commits.
+- Prefer tested code: add/update tests with implementation changes and run the relevant test suite.
+- Public APIs in library crates should generally include doc comments for useful generated docs/docs.rs output.
+- When adding a new dependency, use the latest stable crate version available.
 - Focus on `org.freedesktop.Notifications` over D-Bus.
 - No portal integration in v1.
 
