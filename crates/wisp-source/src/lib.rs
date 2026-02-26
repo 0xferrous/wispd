@@ -163,6 +163,7 @@ impl WispSource {
     ) -> Result<u32, SourceError> {
         let timeout_ms = notification.timeout_ms;
         debug!(app = %notification.app_name, summary = %notification.summary, replaces_id, timeout_ms, "processing notification");
+        debug!("acquiring notifications write lock for notify");
         let mut store = self.inner.notifications.write().await;
 
         if replaces_id != 0
@@ -184,8 +185,14 @@ impl WispSource {
             return Ok(replaces_id);
         }
 
+        drop(store);
+        debug!("allocating notification id");
         let id = self.alloc_id().await;
+        debug!(id, "allocated notification id");
+
         let generation = 0;
+        debug!(id, "re-acquiring notifications write lock for insert");
+        let mut store = self.inner.notifications.write().await;
         store.insert(
             id,
             StoredNotification {
@@ -364,13 +371,16 @@ impl WispSource {
     }
 
     async fn alloc_id(&self) -> u32 {
+        debug!("acquiring next_id write lock");
         let mut next = self.inner.next_id.write().await;
         let id = *next;
         *next = next.saturating_add(1);
+        debug!(id, "next_id advanced");
         id
     }
 
     fn send_event(&self, event: NotificationEvent) -> Result<(), SourceError> {
+        debug!(?event, "sending notification event");
         match self.inner.sender.try_send(event) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
