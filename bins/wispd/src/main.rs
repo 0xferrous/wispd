@@ -8,8 +8,9 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use iced::widget::{button, column, container, row, text};
-use iced::{Background, Color, Element, Font, Length, Subscription, Task, border};
+use iced::widget::button::Status as ButtonStatus;
+use iced::widget::{button, column, container, image, mouse_area, row, text};
+use iced::{Background, Color, ContentFit, Element, Font, Length, Subscription, Task, border};
 use iced_layershell::daemon;
 use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings};
 use iced_layershell::settings::{LayerShellSettings, Settings};
@@ -43,9 +44,18 @@ impl Default for SourceSection {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+enum ClickAction {
+    #[default]
+    Dismiss,
+    InvokeDefaultAction,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct UiSection {
+    #[allow(dead_code)]
     format: String,
     max_visible: usize,
     width: u32,
@@ -53,13 +63,20 @@ struct UiSection {
     gap: u16,
     padding: u16,
     font_size: u16,
+    #[serde(alias = "font")]
     font_family: String,
+    show_icons: bool,
+    max_icon_size: u16,
     anchor: String,
     margin: MarginConfig,
     colors: UrgencyColors,
+    text: TextStyleConfig,
+    buttons: ButtonStyleConfig,
     show_timeout_progress: bool,
     timeout_progress_height: u16,
     timeout_progress_position: String,
+    left_click_action: ClickAction,
+    right_click_action: ClickAction,
 }
 
 impl Default for UiSection {
@@ -73,12 +90,18 @@ impl Default for UiSection {
             padding: 10,
             font_size: 15,
             font_family: "sans-serif".to_string(),
+            show_icons: true,
+            max_icon_size: 32,
             anchor: "top-right".to_string(),
             margin: MarginConfig::default(),
             colors: UrgencyColors::default(),
+            text: TextStyleConfig::default(),
+            buttons: ButtonStyleConfig::default(),
             show_timeout_progress: true,
             timeout_progress_height: 3,
             timeout_progress_position: "bottom".to_string(),
+            left_click_action: ClickAction::Dismiss,
+            right_click_action: ClickAction::InvokeDefaultAction,
         }
     }
 }
@@ -127,6 +150,78 @@ impl Default for UrgencyColors {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct TextStyleConfig {
+    app_name: TextPartStyle,
+    summary: TextPartStyle,
+    body: TextPartStyle,
+}
+
+impl Default for TextStyleConfig {
+    fn default() -> Self {
+        Self {
+            app_name: TextPartStyle {
+                color: "#a89984".to_string(),
+                font_size: None,
+            },
+            summary: TextPartStyle {
+                color: "#fabd2f".to_string(),
+                font_size: None,
+            },
+            body: TextPartStyle {
+                color: "#ebdbb2".to_string(),
+                font_size: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct TextPartStyle {
+    color: String,
+    font_size: Option<u16>,
+}
+
+impl Default for TextPartStyle {
+    fn default() -> Self {
+        Self {
+            color: "#f8f8f2".to_string(),
+            font_size: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ButtonStyleConfig {
+    text_color: String,
+    background: String,
+    border_color: String,
+    hover_background: String,
+    hover_text_color: String,
+    #[serde(alias = "font")]
+    font_family: Option<String>,
+    font_size: Option<u16>,
+    close_font_size: Option<u16>,
+}
+
+impl Default for ButtonStyleConfig {
+    fn default() -> Self {
+        Self {
+            text_color: "#ebdbb2".to_string(),
+            background: "#3c3836".to_string(),
+            border_color: "#665c54".to_string(),
+            hover_background: "#504945".to_string(),
+            hover_text_color: "#fbf1c7".to_string(),
+            font_family: None,
+            font_size: None,
+            close_font_size: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UiAction {
     key: String,
@@ -137,6 +232,7 @@ struct UiAction {
 struct UiNotification {
     id: u32,
     app_name: String,
+    app_icon: String,
     summary: String,
     body: String,
     urgency: Urgency,
@@ -151,7 +247,7 @@ struct WindowBinding {
     notification_id: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceCommand {
     InvokeAction { id: u32, key: String },
     Dismiss { id: u32 },
@@ -336,6 +432,20 @@ impl WispdUi {
         let progress = (elapsed / timeout_ms as f32).clamp(0.0, 1.0);
         Some(progress)
     }
+
+    fn dispatch_click_action(&self, id: u32, action: ClickAction) {
+        let cmd = match action {
+            ClickAction::Dismiss => SourceCommand::Dismiss { id },
+            ClickAction::InvokeDefaultAction => SourceCommand::InvokeAction {
+                id,
+                key: "default".to_string(),
+            },
+        };
+
+        if let Err(err) = self.cmd_tx.send(cmd) {
+            warn!(?err, "failed to send click action command to source thread");
+        }
+    }
 }
 
 #[to_layer_message(multi)]
@@ -344,6 +454,8 @@ enum Message {
     Tick,
     ActionClicked { id: u32, key: String },
     DismissClicked { id: u32 },
+    NotificationLeftClick { id: u32 },
+    NotificationRightClick { id: u32 },
 }
 
 fn namespace() -> String {
@@ -367,6 +479,14 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
             if let Err(err) = state.cmd_tx.send(SourceCommand::Dismiss { id }) {
                 warn!(?err, "failed to send dismiss command to source thread");
             }
+            Task::none()
+        }
+        Message::NotificationLeftClick { id } => {
+            state.dispatch_click_action(id, state.ui.left_click_action);
+            Task::none()
+        }
+        Message::NotificationRightClick { id } => {
+            state.dispatch_click_action(id, state.ui.right_click_action);
             Task::none()
         }
         _ => Task::none(),
@@ -403,25 +523,114 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
             .into();
     };
 
-    let formatted = render_format(&state.ui.format, n);
     let border_color = urgency_color(&state.ui.colors, n.urgency.clone());
     let bg_color = parse_hex_color(&state.ui.colors.background)
         .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
     let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
     let progress_color = parse_hex_color(&state.ui.colors.timeout_progress).unwrap_or(text_color);
+    let app_name_color = parse_hex_color(&state.ui.text.app_name.color).unwrap_or(text_color);
+    let summary_color = parse_hex_color(&state.ui.text.summary.color).unwrap_or(text_color);
+    let body_color = parse_hex_color(&state.ui.text.body.color).unwrap_or(text_color);
+
     let card_width = state.ui.width as f32;
     let card_height = estimate_popup_height(&state.ui, n) as f32;
     let card_padding = state.ui.padding;
-    let font_size = state.ui.font_size as u32;
+
+    let app_name_size = state
+        .ui
+        .text
+        .app_name
+        .font_size
+        .unwrap_or(state.ui.font_size) as u32;
+    let summary_size = state
+        .ui
+        .text
+        .summary
+        .font_size
+        .unwrap_or(state.ui.font_size) as u32;
+    let body_size = state.ui.text.body.font_size.unwrap_or(state.ui.font_size) as u32;
 
     let font = resolve_font(&state.ui.font_family);
 
-    let close_button = button(text("✕")).on_press(Message::DismissClicked { id: n.id });
-    let header = row![
-        container(text(formatted).size(font_size).font(font)).width(Length::Fill),
-        close_button,
-    ]
-    .spacing(8);
+    let button_text_color =
+        parse_hex_color(&state.ui.buttons.text_color).unwrap_or(Color::from_rgb8(0xeb, 0xdb, 0xb2));
+    let button_bg_color =
+        parse_hex_color(&state.ui.buttons.background).unwrap_or(Color::from_rgb8(0x3c, 0x38, 0x36));
+    let button_border_color = parse_hex_color(&state.ui.buttons.border_color)
+        .unwrap_or(Color::from_rgb8(0x66, 0x5c, 0x54));
+    let button_hover_bg_color = parse_hex_color(&state.ui.buttons.hover_background)
+        .unwrap_or(Color::from_rgb8(0x50, 0x49, 0x45));
+    let button_hover_text_color = parse_hex_color(&state.ui.buttons.hover_text_color)
+        .unwrap_or(Color::from_rgb8(0xfb, 0xf1, 0xc7));
+
+    let button_font = state
+        .ui
+        .buttons
+        .font_family
+        .as_deref()
+        .map(resolve_font)
+        .unwrap_or(font);
+    let button_font_size = state.ui.buttons.font_size.unwrap_or(state.ui.font_size) as u32;
+    let close_button_font_size = state.ui.buttons.close_font_size.unwrap_or(
+        state
+            .ui
+            .buttons
+            .font_size
+            .unwrap_or(state.ui.font_size.saturating_sub(2)),
+    ) as u32;
+
+    let close_button = button(
+        text("✕")
+            .size(close_button_font_size)
+            .font(button_font)
+            .color(button_text_color),
+    )
+    .padding([1, 6])
+    .style(move |_, status| {
+        style_button(
+            status,
+            button_bg_color,
+            button_text_color,
+            button_border_color,
+            button_hover_bg_color,
+            button_hover_text_color,
+        )
+    })
+    .on_press(Message::DismissClicked { id: n.id });
+
+    let mut text_block = column![].spacing(2);
+
+    let mut top_line = row![].spacing(6);
+    if !n.app_name.trim().is_empty() {
+        top_line = top_line.push(
+            text(n.app_name.clone())
+                .size(app_name_size)
+                .font(font)
+                .color(app_name_color),
+        );
+    }
+    if !n.summary.trim().is_empty() {
+        top_line = top_line.push(
+            text(n.summary.clone())
+                .size(summary_size)
+                .font(font)
+                .color(summary_color),
+        );
+    }
+    if !n.app_name.trim().is_empty() || !n.summary.trim().is_empty() {
+        text_block = text_block.push(top_line);
+    }
+
+    if !n.body.trim().is_empty() {
+        text_block = text_block.push(
+            text(n.body.clone())
+                .size(body_size)
+                .font(font)
+                .color(body_color),
+        );
+    }
+
+    let header = row![container(text_block).width(Length::Fill), close_button].spacing(8);
 
     let mut card_content = column![header].spacing(8);
 
@@ -429,18 +638,58 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
         for action_chunk in n.actions.chunks(3) {
             let mut actions_row = row![].spacing(8);
             for action in action_chunk {
-                actions_row = actions_row.push(button(text(action.label.clone())).on_press(
-                    Message::ActionClicked {
+                let btn_bg = button_bg_color;
+                let btn_fg = button_text_color;
+                let btn_border = button_border_color;
+                let btn_hover_bg = button_hover_bg_color;
+                let btn_hover_fg = button_hover_text_color;
+
+                actions_row = actions_row.push(
+                    button(
+                        text(action.label.clone())
+                            .font(button_font)
+                            .size(button_font_size)
+                            .color(btn_fg),
+                    )
+                    .style(move |_, status| {
+                        style_button(
+                            status,
+                            btn_bg,
+                            btn_fg,
+                            btn_border,
+                            btn_hover_bg,
+                            btn_hover_fg,
+                        )
+                    })
+                    .on_press(Message::ActionClicked {
                         id: n.id,
                         key: action.key.clone(),
-                    },
-                ));
+                    }),
+                );
             }
             card_content = card_content.push(actions_row);
         }
     }
 
-    let body = container(card_content)
+    let mut content_row = row![].spacing(10);
+    if state.ui.show_icons
+        && let Some(path) = resolve_icon_path(&n.app_icon)
+        && path.is_file()
+    {
+        let icon_size = state.ui.max_icon_size.max(1) as f32;
+        let icon = image(iced::widget::image::Handle::from_path(path))
+            .width(Length::Fixed(icon_size))
+            .height(Length::Fixed(icon_size))
+            .content_fit(ContentFit::Contain);
+        content_row = content_row.push(
+            container(icon)
+                .width(Length::Fixed(icon_size))
+                .height(Length::Fixed(icon_size)),
+        );
+    }
+    content_row = content_row.push(container(card_content).width(Length::Fill));
+
+    let body = container(content_row)
         .padding(card_padding)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -492,7 +741,11 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
                 .border(border::width(2).color(border_color))
         });
 
-    container(column![card])
+    let clickable_card = mouse_area(card)
+        .on_press(Message::NotificationLeftClick { id: n.id })
+        .on_right_press(Message::NotificationRightClick { id: n.id });
+
+    container(column![clickable_card])
         .width(Length::Shrink)
         .style(|_| {
             iced::widget::container::Style::default()
@@ -511,22 +764,32 @@ fn to_ui_notification(
     UiNotification {
         id,
         app_name: notification.app_name,
+        app_icon: notification.app_icon,
         summary: notification.summary,
         body: notification.body,
         urgency: notification.urgency,
-        actions: notification.actions.into_iter().map(to_ui_action).collect(),
+        actions: notification
+            .actions
+            .into_iter()
+            .filter_map(to_ui_action)
+            .collect(),
         timeout_ms,
         created_at: Instant::now(),
     }
 }
 
-fn to_ui_action(action: NotificationAction) -> UiAction {
-    UiAction {
+fn to_ui_action(action: NotificationAction) -> Option<UiAction> {
+    if action.label.trim().is_empty() {
+        return None;
+    }
+
+    Some(UiAction {
         key: action.key,
         label: action.label,
-    }
+    })
 }
 
+#[cfg(test)]
 fn render_format(format: &str, n: &UiNotification) -> String {
     format
         .replace("{id}", &n.id.to_string())
@@ -534,6 +797,40 @@ fn render_format(format: &str, n: &UiNotification) -> String {
         .replace("{summary}", &n.summary)
         .replace("{body}", &n.body)
         .replace("{urgency}", urgency_label(n.urgency.clone()))
+}
+
+fn resolve_icon_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = trimmed.strip_prefix("file://") {
+        return Some(PathBuf::from(path));
+    }
+
+    Some(PathBuf::from(trimmed))
+}
+
+fn style_button(
+    status: ButtonStatus,
+    background: Color,
+    text: Color,
+    border_color: Color,
+    hover_background: Color,
+    hover_text: Color,
+) -> iced::widget::button::Style {
+    let (bg, fg) = match status {
+        ButtonStatus::Hovered | ButtonStatus::Pressed => (hover_background, hover_text),
+        _ => (background, text),
+    };
+
+    iced::widget::button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: fg,
+        border: border::width(1).color(border_color),
+        ..Default::default()
+    }
 }
 
 fn effective_timeout_ms(requested_timeout_ms: i32, default_timeout_ms: Option<i32>) -> Option<u32> {
@@ -547,19 +844,51 @@ fn effective_timeout_ms(requested_timeout_ms: i32, default_timeout_ms: Option<i3
 }
 
 fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
-    let rendered = render_format(&ui.format, n);
+    let app_name_size = ui.text.app_name.font_size.unwrap_or(ui.font_size) as f32;
+    let summary_size = ui.text.summary.font_size.unwrap_or(ui.font_size) as f32;
+    let body_size = ui.text.body.font_size.unwrap_or(ui.font_size) as f32;
+
     let content_width_px = (ui.width as f32 - (ui.padding as f32 * 2.0)).max(80.0);
-    let approx_char_width = (ui.font_size as f32 * 0.54).max(1.0);
-    let chars_per_line = (content_width_px / approx_char_width).floor().max(1.0) as usize;
 
-    let wrapped_lines = rendered
-        .lines()
-        .map(|line| wrapped_line_count(line, chars_per_line))
-        .sum::<usize>()
-        .max(1);
+    let header_text = match (n.app_name.trim().is_empty(), n.summary.trim().is_empty()) {
+        (false, false) => format!("{} {}", n.app_name, n.summary),
+        (false, true) => n.app_name.clone(),
+        (true, false) => n.summary.clone(),
+        (true, true) => String::new(),
+    };
 
-    let line_height = (ui.font_size as f32 * 1.30).ceil() as u32;
-    let text_height = wrapped_lines as u32 * line_height;
+    let header_font_size = app_name_size.max(summary_size).max(1.0);
+    let header_char_width = (header_font_size * 0.54).max(1.0);
+    let header_chars_per_line = (content_width_px / header_char_width).floor().max(1.0) as usize;
+    let header_wrapped_lines = if header_text.is_empty() {
+        0
+    } else {
+        wrapped_line_count(&header_text, header_chars_per_line)
+    };
+    let header_line_height = (header_font_size * 1.30).ceil() as u32;
+    let header_height = header_wrapped_lines as u32 * header_line_height;
+
+    let body_char_width = (body_size * 0.54).max(1.0);
+    let body_chars_per_line = (content_width_px / body_char_width).floor().max(1.0) as usize;
+    let body_wrapped_lines = if n.body.trim().is_empty() {
+        0
+    } else {
+        n.body
+            .lines()
+            .map(|line| wrapped_line_count(line, body_chars_per_line))
+            .sum::<usize>()
+            .max(1)
+    };
+    let body_line_height = (body_size * 1.30).ceil() as u32;
+    let body_height = body_wrapped_lines as u32 * body_line_height;
+
+    let text_height = header_height.saturating_add(body_height);
+    let icon_height = if ui.show_icons && resolve_icon_path(&n.app_icon).is_some() {
+        ui.max_icon_size.max(1) as u32
+    } else {
+        0
+    };
+    let content_height = text_height.max(icon_height);
 
     let actions_rows = n.actions.len().div_ceil(3) as u32;
     let action_row_height = (ui.font_size as f32 * 1.9).ceil() as u32;
@@ -575,9 +904,9 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
         0
     };
 
-    let chrome = ui.padding as u32 * 2 + 6 + progress_height;
+    let chrome = ui.padding as u32 * 2 + 10 + progress_height;
 
-    text_height
+    content_height
         .saturating_add(actions_height)
         .saturating_add(chrome)
         .max(ui.height.max(1))
@@ -622,7 +951,9 @@ fn wrapped_line_count(line: &str, max_chars: usize) -> usize {
 }
 
 fn resolve_font(raw: &str) -> Font {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let trimmed = raw.trim();
+
+    match trimmed.to_ascii_lowercase().as_str() {
         "sans" | "sans-serif" => Font::DEFAULT,
         "serif" => Font {
             family: iced::font::Family::Serif,
@@ -637,13 +968,14 @@ fn resolve_font(raw: &str) -> Font {
             family: iced::font::Family::Fantasy,
             ..Font::DEFAULT
         },
-        custom => {
-            let leaked: &'static str = Box::leak(custom.to_string().into_boxed_str());
+        _ => {
+            let leaked: &'static str = Box::leak(trimmed.to_string().into_boxed_str());
             Font::with_name(leaked)
         }
     }
 }
 
+#[cfg(test)]
 fn urgency_label(urgency: Urgency) -> &'static str {
     match urgency {
         Urgency::Low => "low",
@@ -960,6 +1292,7 @@ mod tests {
         let n = UiNotification {
             id: 9,
             app_name: "mail".to_string(),
+            app_icon: String::new(),
             summary: "new message".to_string(),
             body: "hello".to_string(),
             urgency: Urgency::Critical,
@@ -983,6 +1316,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_icon_path_supports_file_uri() {
+        assert_eq!(
+            resolve_icon_path("file:///tmp/icon.png"),
+            Some(PathBuf::from("/tmp/icon.png"))
+        );
+    }
+
+    #[test]
+    fn empty_action_labels_are_filtered_from_ui() {
+        let ui_notification = to_ui_notification(
+            1,
+            Notification {
+                actions: vec![
+                    NotificationAction {
+                        key: "default".to_string(),
+                        label: " ".to_string(),
+                    },
+                    NotificationAction {
+                        key: "open".to_string(),
+                        label: "Open".to_string(),
+                    },
+                ],
+                ..Notification::default()
+            },
+            None,
+        );
+
+        assert_eq!(ui_notification.actions.len(), 1);
+        assert_eq!(ui_notification.actions[0].key, "open");
+        assert_eq!(ui_notification.actions[0].label, "Open");
+    }
+
+    #[test]
+    fn ui_font_can_be_configured_via_font_alias() {
+        let cfg: AppConfig = toml::from_str("[ui]\nfont = \"JetBrains Mono\"\n").unwrap();
+        assert_eq!(cfg.ui.font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn button_font_can_be_configured_via_font_alias() {
+        let cfg: AppConfig =
+            toml::from_str("[ui.buttons]\nfont = \"Recursive Mono Casual Static\"\n").unwrap();
+        assert_eq!(
+            cfg.ui.buttons.font_family.as_deref(),
+            Some("Recursive Mono Casual Static")
+        );
+    }
+
+    #[test]
     fn effective_timeout_uses_default_for_negative() {
         assert_eq!(effective_timeout_ms(-1, Some(5_000)), Some(5_000));
     }
@@ -990,5 +1372,44 @@ mod tests {
     #[test]
     fn effective_timeout_disables_for_zero() {
         assert_eq!(effective_timeout_ms(0, Some(5_000)), None);
+    }
+
+    #[test]
+    fn left_click_can_invoke_default_action() {
+        let (_tx, rx) = mpsc::channel();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let ui_cfg = UiSection {
+            left_click_action: ClickAction::InvokeDefaultAction,
+            ..UiSection::default()
+        };
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, ui_cfg, None);
+
+        let _ = update(&mut ui, Message::NotificationLeftClick { id: 42 });
+
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            SourceCommand::InvokeAction {
+                id: 42,
+                key: "default".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn right_click_can_dismiss() {
+        let (_tx, rx) = mpsc::channel();
+        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
+        let ui_cfg = UiSection {
+            right_click_action: ClickAction::Dismiss,
+            ..UiSection::default()
+        };
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, ui_cfg, None);
+
+        let _ = update(&mut ui, Message::NotificationRightClick { id: 11 });
+
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            SourceCommand::Dismiss { id: 11 }
+        );
     }
 }

@@ -45,7 +45,7 @@ Checklist for `org.freedesktop.Notifications` support right now:
 - [~] Extra hints preserved as debug strings (not fully interpreted)
 - [ ] Rich hints/attachments (images, sound, progress, etc.)
 - [ ] Markup rendering
-- [ ] Icon rendering in UI
+- [x] Icon rendering in UI (path/file URI icons)
 
 ## Requirements
 
@@ -121,6 +121,11 @@ Config file path:
 
 Example:
 
+`left_click_action` / `right_click_action` allowed values:
+- `"dismiss"`
+- `"invoke-default-action"` (invokes action key `default`)
+
+
 ```toml
 [source]
 default_timeout_ms = 5000
@@ -134,11 +139,16 @@ height = 64
 gap = 8
 padding = 10
 font_size = 15
-font_family = "sans-serif"
+# `font` is an alias for `font_family`
+font = "sans-serif"
+show_icons = true
+max_icon_size = 32
 anchor = "top-right"
 show_timeout_progress = true
 timeout_progress_height = 3
 timeout_progress_position = "bottom"
+left_click_action = "dismiss"
+right_click_action = "invoke-default-action"
 
 [ui.margin]
 top = 16
@@ -151,8 +161,33 @@ low = "#6aa9ff"
 normal = "#7dcf7d"
 critical = "#ff6b6b"
 background = "#1e1e2ecc"
-text = "#f8f8f2"
+text = "#f8f8f2" # fallback text color
 timeout_progress = "#f8f8f2"
+
+[ui.text.app_name]
+color = "#a89984"
+font_size = 15
+
+[ui.text.summary]
+color = "#f8f8f2"
+font_size = 15
+
+[ui.text.body]
+color = "#f8f8f2"
+font_size = 15
+
+[ui.buttons]
+text_color = "#ebdbb2"
+background = "#3c3836"
+border_color = "#665c54"
+hover_background = "#504945"
+hover_text_color = "#fbf1c7"
+# optional: defaults to ui.font
+font = "Recursive Mono Casual Static"
+# optional: defaults to ui.font_size
+font_size = 15
+# optional: defaults to (font_size or ui.font_size - 2)
+close_font_size = 13
 ```
 
 ## Niri + wispd MicroVM (QEMU)
