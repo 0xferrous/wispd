@@ -15,17 +15,21 @@ Only **one process** can own that bus name at a time.
 - If `mako`/`dunst` already owns it, `wisp-debug`/`wispd` cannot start as server.
 - The notification daemon is the **server** (name owner).
 - Apps are **clients** (they call methods like `Notify`).
+- `wispd-monitor` is passive and does **not** own `org.freedesktop.Notifications`.
 
 ## 2) Workspace layout
 
 ```text
 crates/
-  wisp-types   # shared Rust types/events
-  wisp-source  # D-Bus server + notification store + event stream
+  wisp-types    # shared Rust types/events
+  wisp-source   # D-Bus server + notification store + event stream
+  wisp-monitor  # shared passive D-Bus monitoring/parsing helpers
 
 bins/
-  wispd        # iced + layer-shell frontend with queue policy + popup rendering
-  wisp-debug   # debug daemon entrypoint that logs incoming notifications
+  wispd         # iced + layer-shell frontend with queue policy + popup rendering
+  wisp-debug    # debug daemon entrypoint that logs incoming notifications
+  wispd-monitor # passive D-Bus monitor for notifications traffic
+  wispd-forward # host->VM notification forwarder via SSH
 ```
 
 ## 3) Current runtime flow
@@ -156,4 +160,6 @@ notify-send "hello" "from notify-send"
 
 If startup fails with "name already taken on the bus", stop the currently running notification daemon first.
 
-`wispd` requires a Wayland session and Wayland runtime libraries. If you see `NoWaylandLib`, run inside `nix develop` (this flake exports `LD_LIBRARY_PATH` for `wayland`/`libxkbcommon`) and verify `WAYLAND_DISPLAY` is set.
+`wispd-forward` uses `BecomeMonitor` to observe host `Notify` method calls and replays them in the VM via SSH (`notify-send` on guest). This allows host `mako` to stay active while testing `wispd` in a VM.
+
+`wispd` requires a Wayland session and Wayland runtime libraries. If you see `NoWaylandLib`, run inside `nix develop`, verify `WAYLAND_DISPLAY` is set, and ensure Wayland runtime libs are available in the runtime environment.

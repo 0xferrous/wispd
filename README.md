@@ -5,6 +5,8 @@ It includes:
 
 - **`wispd`**: layer-shell popup UI (one popup window per notification)
 - **`wisp-debug`**: CLI/debug daemon to inspect incoming notifications and test close/action flows
+- **`wispd-monitor`**: passive D-Bus monitor for notifications traffic (does not own `org.freedesktop.Notifications`)
+- **`wispd-forward`**: forwards host notifications into a VM over SSH (keeps host daemon like `mako` active)
 - Reusable crates:
   - `wisp-source` (D-Bus server + notification lifecycle)
   - `wisp-types` (shared notification/event types)
@@ -77,6 +79,38 @@ nix develop
 cargo run -p wispd
 ```
 
+### 3) Run passive monitor (no name ownership)
+
+```bash
+cargo run -p wispd-monitor
+```
+
+Or via flake app:
+
+```bash
+nix run .#wispd-monitor
+```
+
+### 4) Forward host notifications into VM (while keeping host mako)
+
+```bash
+# defaults: wisp@127.0.0.1:2222 and remote notify-send
+cargo run -p wispd-forward
+
+# or
+nix run .#wispd-forward
+```
+
+Useful env vars:
+
+- `WISPD_FORWARD_SSH_HOST` (default: `127.0.0.1`)
+- `WISPD_FORWARD_SSH_PORT` (default: `2222`)
+- `WISPD_FORWARD_SSH_USER` (default: `wisp`)
+- `WISPD_FORWARD_SSH_PASSWORD` (default: `wisp`)
+- `WISPD_FORWARD_NOTIFY_SEND` (default: `notify-send`)
+- `WISPD_FORWARD_SSH_STARTUP_WAIT_SECS` (default: `60`)
+- `WISPD_FORWARD_SSH_STARTUP_POLL_MS` (default: `500`)
+
 ## Configuration
 
 Config file path:
@@ -116,12 +150,74 @@ background = "#1e1e2ecc"
 text = "#f8f8f2"
 ```
 
+## Niri + wispd MicroVM (QEMU)
+
+A ready-to-run MicroVM configuration is included via `github:microvm-nix/microvm.nix`.
+
+What it configures:
+
+- QEMU MicroVM with graphics enabled
+- Niri compositor started at boot via `greetd`
+- `wispd` started as a `systemd --user` service in the graphical session
+- `alacritty` installed (and exported as `TERMINAL`)
+- SSH enabled in guest, forwarded as host `127.0.0.1:2222 -> guest:22` (for `wispd-forward`)
+
+Run it:
+
+```bash
+nix run .#wispd-microvm
+```
+
+Inside the VM:
+
+- user: `wisp`
+- graphical login: passwordless (auto-login via `greetd`)
+- SSH password (for `wispd-forward`): `wisp`
+
+Test notifications in `alacritty`:
+
+```bash
+notify-send "hello" "from wispd microvm"
+```
+
+
 ## Development
+
+Rust checks:
 
 ```bash
 cargo fmt
 cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
+
+Nix package build (uses `ipetkov/crane` for faster incremental dependency reuse):
+
+```bash
+nix build .#wispd
+```
+
+MicroVM development / validation:
+
+```bash
+# evaluate exposed outputs
+nix flake show
+
+# dry-run build of the runnable qemu microvm package
+nix build .#wispd-microvm --dry-run
+
+# run the VM
+nix run .#wispd-microvm
+```
+
+MicroVM config source:
+
+- `flake.nix` (inputs + `nixosConfigurations.wispd-microvm` + app/package outputs)
+- `nix/microvm/wispd-microvm.nix` (Niri/greetd/wispd/alacritty VM config)
+
+Dev convenience setup:
+
+- `wispd-forward` defaults are aligned with the bundled microvm (`127.0.0.1:2222`, user `wisp`, password `wisp`).
+- Forwarder startup polls until VM SSH is reachable, so it can be started before or during VM boot.
 
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for implementation details and current behavior.

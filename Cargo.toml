@@ -2,8 +2,11 @@
 members = [
   "crates/wisp-types",
   "crates/wisp-source",
+  "crates/wisp-monitor",
   "bins/wispd",
   "bins/wisp-debug",
+  "bins/wispd-monitor",
+  "bins/wispd-forward",
 ]
 resolver = "2"
 
@@ -16,7 +19,7 @@ license = "MIT"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "process", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = "5"
