@@ -26,8 +26,13 @@
           ./nix/microvm/wispd-microvm.nix
         ];
       };
+
+      homeManagerModules = {
+        wispd = import ./nix/home-manager/wispd.nix { inherit self; };
+        default = self.homeManagerModules.wispd;
+      };
     }
-    // flake-utils.lib.eachDefaultSystem (system:
+    // flake-utils.lib.eachDefaultSystem (system: 
       let
         pkgs = import nixpkgs { inherit system; };
         craneLib = crane.mkLib pkgs;

@@ -195,6 +195,35 @@ font_size = 15
 close_font_size = 13
 ```
 
+## Home Manager module
+
+This flake exports `homeManagerModules.wispd`.
+
+Example:
+
+```nix
+{
+  inputs.wispd.url = "github:dmnt/wispd";
+
+  outputs = { self, nixpkgs, home-manager, wispd, ... }: {
+    homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+      pkgs = import nixpkgs { system = "x86_64-linux"; };
+      modules = [
+        wispd.homeManagerModules.wispd
+        ({ ... }: {
+          services.wispd.enable = true;
+          services.wispd.rustLog = "info,wispd=debug,wisp_source=debug";
+          # services.wispd.package = wispd.packages.${pkgs.system}.wispd; # optional override
+        })
+      ];
+    };
+  };
+}
+```
+
+The module creates a `systemd --user` service (`wispd.service`) and sets a runtime
+`LD_LIBRARY_PATH`/`PATH` for Wayland and libxkbcommon dependencies.
+
 ## Niri + wispd MicroVM (QEMU)
 
 A ready-to-run MicroVM configuration is included via `github:microvm-nix/microvm.nix`.
