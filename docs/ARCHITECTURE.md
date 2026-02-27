@@ -80,6 +80,13 @@ Not implemented yet:
 - richer hint coverage (images/sound/etc beyond current parsed subset)
 - polished visual styling/layout behavior expected from mature daemons
 
+Known bug (tracked):
+
+- Multi-display focused-output behavior is still unreliable in some compositor setups.
+  - Symptom: notifications can appear on a non-focused monitor even with `ui.output = "focused"`.
+  - Current behavior uses compositor-picked first popup + sticky stack heuristics (and optional `focused_output_command` override), but this does not fully match mako behavior yet.
+  - Likely fix direction: move from per-notification layer-shell surfaces to mako-like grouped/stacked surface ownership per output/anchor/layer (or introduce explicit compositor focus tracking via protocol integration).
+
 ## 5) Types and events
 
 Main shared types in `wisp-types`:
@@ -121,7 +128,7 @@ Config file is loaded from:
 - `font_family` (alias: `font`)
 - `anchor`
 - `output` (`focused`, `last-output` sticky, `none`/`default`, or exact output name like `DP-1`)
-- `focused_output_command` (optional shell command; first stdout line used as focused output name when `output = "focused"`)
+- `focused_output_command` (optional shell command override; first stdout line used as focused output name when `output = "focused"`; if unset, `focused` uses compositor-picked output for first popup and sticky `last-output` while stack is visible)
 - `margin` (`top`, `right`, `bottom`, `left`)
 - urgency colors (`low`, `normal`, `critical`) plus base `background`, `text`, and `timeout_progress`
 - timeout progress indicator controls:

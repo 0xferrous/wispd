@@ -53,7 +53,7 @@ Future:
 TOML-configurable:
 - anchor
 - output target (`focused`, `last-output` sticky, `none`/`default`, or output name)
-- optional `focused_output_command` to resolve focused output name dynamically (first stdout line)
+- optional `focused_output_command` override to resolve focused output name dynamically (first stdout line); otherwise `focused` uses compositor-picked output for first popup and sticky `last-output` for remaining stack
 - margin
 - gap
 - max_visible
@@ -77,6 +77,7 @@ TOML-configurable:
 
 ## 7. Deferred but important (post-v1)
 
+- Robust multi-display focused-output behavior parity with mako (currently unreliable in some compositor setups with per-notification surfaces)
 - Icon rendering
 - Markup parsing
 - Animations

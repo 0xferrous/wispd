@@ -13,7 +13,9 @@ use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, container, image, mouse_area, row, text};
 use iced::{Background, Color, ContentFit, Element, Font, Length, Subscription, Task, border};
 use iced_layershell::daemon;
-use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings, OutputOption};
+use iced_layershell::reexport::{
+    Anchor, IcedId, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption,
+};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use serde::Deserialize;
@@ -349,7 +351,9 @@ impl WispdUi {
             output_option: output_option_from_config(
                 &self.ui.output,
                 self.ui.focused_output_command.as_deref(),
+                !self.windows.is_empty(),
             ),
+            keyboard_interactivity: KeyboardInteractivity::None,
             exclusive_zone: Some(0),
             margin: Some((
                 self.ui.margin.top,
@@ -1043,15 +1047,27 @@ fn layer_anchor_from_str(anchor: &str) -> Anchor {
     }
 }
 
-fn output_option_from_config(output: &str, focused_output_command: Option<&str>) -> OutputOption {
+fn output_option_from_config(
+    output: &str,
+    focused_output_command: Option<&str>,
+    has_existing_windows: bool,
+) -> OutputOption {
     let trimmed = output.trim();
     let lower = trimmed.to_ascii_lowercase();
 
     match lower.as_str() {
+        // Mako-like behavior:
+        // - with an empty stack, let compositor pick (usually focused/current output)
+        // - with existing stack windows, keep using the last output so all popups stay together
         "focused" => resolve_focused_output_name(focused_output_command)
             .map(OutputOption::OutputName)
-            .unwrap_or(OutputOption::None),
-        // Sticky output: follow last active output of this surface family.
+            .unwrap_or_else(|| {
+                if has_existing_windows {
+                    OutputOption::LastOutput
+                } else {
+                    OutputOption::None
+                }
+            }),
         "last-output" | "last_output" => OutputOption::LastOutput,
         "any" | "none" | "default" => OutputOption::None,
         _ if trimmed.is_empty() => OutputOption::None,
@@ -1225,6 +1241,7 @@ fn main() -> Result<()> {
             exclusive_zone: 0,
             margin: (0, 0, 0, 0),
             size: Some((1, 1)),
+            keyboard_interactivity: KeyboardInteractivity::None,
             ..Default::default()
         },
         ..Default::default()
@@ -1415,17 +1432,25 @@ mod tests {
     }
 
     #[test]
-    fn output_option_parses_focused() {
+    fn output_option_parses_focused_with_empty_stack() {
         assert_eq!(
-            output_option_from_config("focused", None),
+            output_option_from_config("focused", None, false),
             OutputOption::None
+        );
+    }
+
+    #[test]
+    fn output_option_parses_focused_with_existing_stack() {
+        assert_eq!(
+            output_option_from_config("focused", None, true),
+            OutputOption::LastOutput
         );
     }
 
     #[test]
     fn output_option_parses_last_output() {
         assert_eq!(
-            output_option_from_config("last-output", None),
+            output_option_from_config("last-output", None, false),
             OutputOption::LastOutput
         );
     }
@@ -1433,7 +1458,7 @@ mod tests {
     #[test]
     fn output_option_parses_output_name() {
         assert_eq!(
-            output_option_from_config("DP-1", None),
+            output_option_from_config("DP-1", None, false),
             OutputOption::OutputName("DP-1".to_string())
         );
     }
@@ -1441,7 +1466,7 @@ mod tests {
     #[test]
     fn output_option_uses_focused_command_when_provided() {
         assert_eq!(
-            output_option_from_config("focused", Some("printf 'DP-3\\n'")),
+            output_option_from_config("focused", Some("printf 'DP-3\\n'"), false),
             OutputOption::OutputName("DP-3".to_string())
         );
     }
