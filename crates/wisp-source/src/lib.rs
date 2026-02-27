@@ -94,6 +94,7 @@ struct Inner {
     notifications: Mutex<HashMap<u32, StoredNotification>>,
     next_id: AtomicU32,
     dbus_connection: RwLock<Option<zbus::Connection>>,
+    runtime_handle: Option<Handle>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +127,7 @@ impl WispSource {
                 notifications: Mutex::new(HashMap::new()),
                 next_id: AtomicU32::new(1),
                 dbus_connection: RwLock::new(None),
+                runtime_handle: Handle::try_current().ok(),
             }),
         };
 
@@ -313,13 +315,15 @@ impl WispSource {
             return;
         };
 
-        // NOTE: We observed `Notify` hanging in some runs and suspected timeout spawning as one
-        // possible trigger when no current Tokio context is available here. This diagnosis is not
-        // fully proven, but guarding with `try_current` keeps this path non-panicking/fallible.
-        let Ok(handle) = Handle::try_current() else {
+        let handle = self
+            .inner
+            .runtime_handle
+            .clone()
+            .or_else(|| Handle::try_current().ok());
+        let Some(handle) = handle else {
             warn!(
                 id,
-                "no tokio runtime context available; skipping timeout scheduling"
+                "no tokio runtime handle available; skipping timeout scheduling"
             );
             return;
         };

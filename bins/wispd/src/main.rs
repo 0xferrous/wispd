@@ -4,7 +4,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -57,6 +57,9 @@ struct UiSection {
     anchor: String,
     margin: MarginConfig,
     colors: UrgencyColors,
+    show_timeout_progress: bool,
+    timeout_progress_height: u16,
+    timeout_progress_position: String,
 }
 
 impl Default for UiSection {
@@ -73,6 +76,9 @@ impl Default for UiSection {
             anchor: "top-right".to_string(),
             margin: MarginConfig::default(),
             colors: UrgencyColors::default(),
+            show_timeout_progress: true,
+            timeout_progress_height: 3,
+            timeout_progress_position: "bottom".to_string(),
         }
     }
 }
@@ -105,6 +111,7 @@ struct UrgencyColors {
     critical: String,
     background: String,
     text: String,
+    timeout_progress: String,
 }
 
 impl Default for UrgencyColors {
@@ -115,6 +122,7 @@ impl Default for UrgencyColors {
             critical: "#ff6b6b".to_string(),
             background: "#1e1e2ecc".to_string(),
             text: "#f8f8f2".to_string(),
+            timeout_progress: "#f8f8f2".to_string(),
         }
     }
 }
@@ -133,6 +141,8 @@ struct UiNotification {
     body: String,
     urgency: Urgency,
     actions: Vec<UiAction>,
+    timeout_ms: Option<u32>,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +164,7 @@ struct WispdUi {
     notifications: HashMap<u32, UiNotification>,
     windows: VecDeque<WindowBinding>,
     ui: UiSection,
+    default_timeout_ms: Option<i32>,
 }
 
 impl WispdUi {
@@ -161,6 +172,7 @@ impl WispdUi {
         events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
         cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
         ui: UiSection,
+        default_timeout_ms: Option<i32>,
     ) -> Self {
         Self {
             events,
@@ -168,6 +180,7 @@ impl WispdUi {
             notifications: HashMap::new(),
             windows: VecDeque::new(),
             ui,
+            default_timeout_ms,
         }
     }
 
@@ -204,8 +217,10 @@ impl WispdUi {
         match event {
             NotificationEvent::Received { id, notification } => self.insert_new(id, *notification),
             NotificationEvent::Replaced { id, current, .. } => {
-                self.notifications
-                    .insert(id, to_ui_notification(id, *current));
+                self.notifications.insert(
+                    id,
+                    to_ui_notification(id, *current, self.default_timeout_ms),
+                );
                 Task::none()
             }
             NotificationEvent::Closed { id, .. } => self.remove_notification(id),
@@ -214,8 +229,10 @@ impl WispdUi {
     }
 
     fn insert_new(&mut self, id: u32, notification: Notification) -> Task<Message> {
-        self.notifications
-            .insert(id, to_ui_notification(id, notification));
+        self.notifications.insert(
+            id,
+            to_ui_notification(id, notification, self.default_timeout_ms),
+        );
 
         if self.windows.iter().any(|w| w.notification_id == id) {
             return Task::none();
@@ -311,6 +328,14 @@ impl WispdUi {
             .map(|n| estimate_popup_height(&self.ui, n))
             .unwrap_or(self.ui.height.max(1))
     }
+
+    fn timeout_progress_for(&self, id: u32) -> Option<f32> {
+        let n = self.notifications.get(&id)?;
+        let timeout_ms = n.timeout_ms?;
+        let elapsed = n.created_at.elapsed().as_secs_f32() * 1000.0;
+        let progress = (elapsed / timeout_ms as f32).clamp(0.0, 1.0);
+        Some(progress)
+    }
 }
 
 #[to_layer_message(multi)]
@@ -326,7 +351,7 @@ fn namespace() -> String {
 }
 
 fn subscription(_: &WispdUi) -> Subscription<Message> {
-    iced::time::every(Duration::from_millis(80)).map(|_| Message::Tick)
+    iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick)
 }
 
 fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
@@ -383,6 +408,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     let bg_color = parse_hex_color(&state.ui.colors.background)
         .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
     let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
+    let progress_color = parse_hex_color(&state.ui.colors.timeout_progress).unwrap_or(text_color);
     let card_width = state.ui.width as f32;
     let card_height = estimate_popup_height(&state.ui, n) as f32;
     let card_padding = state.ui.padding;
@@ -414,14 +440,55 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
         }
     }
 
-    let card = container(card_content)
+    let body = container(card_content)
         .padding(card_padding)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| iced::widget::container::Style::default().color(text_color));
+
+    let timeout_progress = state
+        .timeout_progress_for(n.id)
+        .filter(|_| state.ui.show_timeout_progress);
+
+    let progress_height = state.ui.timeout_progress_height.max(1) as f32;
+
+    let card_stack = if let Some(progress) = timeout_progress {
+        let fill_width = (card_width * progress).max(0.0);
+        let fill = container(text(""))
+            .width(Length::Fixed(fill_width))
+            .height(Length::Fixed(progress_height))
+            .style(move |_| {
+                iced::widget::container::Style::default()
+                    .background(Background::Color(progress_color))
+            });
+        let empty = container(text(""))
+            .width(Length::Fill)
+            .height(Length::Fixed(progress_height))
+            .style(|_| {
+                iced::widget::container::Style::default()
+                    .background(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.08)))
+            });
+        let progress_bar = row![fill, empty].spacing(0);
+
+        if state
+            .ui
+            .timeout_progress_position
+            .eq_ignore_ascii_case("top")
+        {
+            column![progress_bar, body]
+        } else {
+            column![body, progress_bar]
+        }
+    } else {
+        column![body]
+    };
+
+    let card = container(card_stack)
         .width(Length::Fixed(card_width))
         .height(Length::Fixed(card_height))
         .style(move |_| {
             iced::widget::container::Style::default()
                 .background(Background::Color(bg_color))
-                .color(text_color)
                 .border(border::width(2).color(border_color))
         });
 
@@ -434,7 +501,13 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
         .into()
 }
 
-fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
+fn to_ui_notification(
+    id: u32,
+    notification: Notification,
+    default_timeout_ms: Option<i32>,
+) -> UiNotification {
+    let timeout_ms = effective_timeout_ms(notification.timeout_ms, default_timeout_ms);
+
     UiNotification {
         id,
         app_name: notification.app_name,
@@ -442,6 +515,8 @@ fn to_ui_notification(id: u32, notification: Notification) -> UiNotification {
         body: notification.body,
         urgency: notification.urgency,
         actions: notification.actions.into_iter().map(to_ui_action).collect(),
+        timeout_ms,
+        created_at: Instant::now(),
     }
 }
 
@@ -459,6 +534,16 @@ fn render_format(format: &str, n: &UiNotification) -> String {
         .replace("{summary}", &n.summary)
         .replace("{body}", &n.body)
         .replace("{urgency}", urgency_label(n.urgency.clone()))
+}
+
+fn effective_timeout_ms(requested_timeout_ms: i32, default_timeout_ms: Option<i32>) -> Option<u32> {
+    let effective = match requested_timeout_ms {
+        0 => return None,
+        x if x < 0 => default_timeout_ms?,
+        x => x,
+    };
+
+    u32::try_from(effective).ok().filter(|value| *value > 0)
 }
 
 fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
@@ -484,7 +569,13 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
         actions_rows * action_row_height + 8
     };
 
-    let chrome = ui.padding as u32 * 2 + 6;
+    let progress_height = if ui.show_timeout_progress && n.timeout_ms.is_some() {
+        ui.timeout_progress_height.max(1) as u32
+    } else {
+        0
+    };
+
+    let chrome = ui.padding as u32 * 2 + 6 + progress_height;
 
     text_height
         .saturating_add(actions_height)
@@ -746,6 +837,7 @@ fn main() -> Result<()> {
     let events = Arc::new(Mutex::new(ui_rx));
     let boot_events = Arc::clone(&events);
     let ui_cfg = app_cfg.ui.clone();
+    let ui_default_timeout_ms = app_cfg.source.default_timeout_ms;
     let boot_cmd_tx = cmd_tx.clone();
 
     let settings = Settings {
@@ -767,6 +859,7 @@ fn main() -> Result<()> {
                 Arc::clone(&boot_events),
                 boot_cmd_tx.clone(),
                 ui_cfg.clone(),
+                ui_default_timeout_ms,
             )
         },
         namespace,
@@ -816,7 +909,7 @@ mod tests {
     fn newest_goes_to_front() {
         let (_tx, rx) = mpsc::channel();
         let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -830,7 +923,7 @@ mod tests {
     fn replacement_keeps_slot() {
         let (_tx, rx) = mpsc::channel();
         let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -851,7 +944,7 @@ mod tests {
     fn close_removes_notification() {
         let (_tx, rx) = mpsc::channel();
         let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default());
+        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(NotificationEvent::Closed {
@@ -871,6 +964,8 @@ mod tests {
             body: "hello".to_string(),
             urgency: Urgency::Critical,
             actions: vec![],
+            timeout_ms: None,
+            created_at: Instant::now(),
         };
 
         let rendered = render_format("{id} {app_name} {summary} {body} {urgency}", &n);
@@ -885,5 +980,15 @@ mod tests {
     #[test]
     fn wrapped_line_count_wraps_words_with_spaces() {
         assert_eq!(wrapped_line_count("one two three four", 7), 3);
+    }
+
+    #[test]
+    fn effective_timeout_uses_default_for_negative() {
+        assert_eq!(effective_timeout_ms(-1, Some(5_000)), Some(5_000));
+    }
+
+    #[test]
+    fn effective_timeout_disables_for_zero() {
+        assert_eq!(effective_timeout_ms(0, Some(5_000)), None);
     }
 }

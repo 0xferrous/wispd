@@ -18,6 +18,7 @@ Early-stage but functional:
 - Implements `Notify`, `CloseNotification`, `GetCapabilities`, `GetServerInformation`
 - Supports replacement (`replaces_id`), timeouts, actions, and D-Bus close/action signals
 - Configurable popup layout/colors/format via TOML
+- Optional timeout progress bar (top/bottom edge) for timed notifications
 
 ## freedesktop.org Notifications API coverage
 
@@ -135,6 +136,9 @@ padding = 10
 font_size = 15
 font_family = "sans-serif"
 anchor = "top-right"
+show_timeout_progress = true
+timeout_progress_height = 3
+timeout_progress_position = "bottom"
 
 [ui.margin]
 top = 16
@@ -148,6 +152,7 @@ normal = "#7dcf7d"
 critical = "#ff6b6b"
 background = "#1e1e2ecc"
 text = "#f8f8f2"
+timeout_progress = "#f8f8f2"
 ```
 
 ## Niri + wispd MicroVM (QEMU)
@@ -158,7 +163,8 @@ What it configures:
 
 - QEMU MicroVM with graphics enabled
 - Niri compositor started at boot via `greetd`
-- `wispd` started as a `systemd --user` service in the graphical session
+- `wispd` started as a `systemd --user` service from `/work/wispd/target/debug/wispd`
+- host workspace is shared into the guest at `/work/wispd` via a relative `9p` share (`source = "."`)
 - `alacritty` installed (and exported as `TERMINAL`)
 - SSH enabled in guest, forwarded as host `127.0.0.1:2222 -> guest:22` (for `wispd-forward`)
 
@@ -180,6 +186,15 @@ Test notifications in `alacritty`:
 notify-send "hello" "from wispd microvm"
 ```
 
+Hot-reload-ish dev loop (no VM reboot):
+
+```bash
+# host
+cargo build -p wispd
+
+# guest
+systemctl --user restart wispd
+```
 
 ## Development
 

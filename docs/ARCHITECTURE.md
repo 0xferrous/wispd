@@ -44,6 +44,7 @@ bins/
 8. `wispd` runs `wisp-source` on a dedicated Tokio runtime thread and forwards events to the UI via a std channel.
 9. `wispd` applies queue policy (max visible, newest on top, replacement in-place).
 10. `wispd` opens one layer-shell window per visible notification and reflows their margins for stacking.
+11. For timed notifications, `wispd` renders a progress edge bar (top/bottom) using elapsed time vs effective timeout.
 
 ## 4) `wisp-source` responsibilities
 
@@ -120,7 +121,11 @@ Config file is loaded from:
 - `font_family`
 - `anchor`
 - `margin` (`top`, `right`, `bottom`, `left`)
-- urgency colors (`low`, `normal`, `critical`) plus base `background` and `text`
+- urgency colors (`low`, `normal`, `critical`) plus base `background`, `text`, and `timeout_progress`
+- timeout progress indicator controls:
+  - `show_timeout_progress`
+  - `timeout_progress_height`
+  - `timeout_progress_position` (`top` / `bottom`)
 
 ## 7) Testing status
 

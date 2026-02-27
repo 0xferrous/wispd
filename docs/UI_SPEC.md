@@ -36,6 +36,7 @@ All config is TOML.
 - `default_timeout_ms` is user-configurable.
 - If `default_timeout_ms` is unset, notifications are persistent by default.
 - Explicit per-notification timeout is still respected.
+- Timed notifications can render a timeout progress bar (top or bottom edge) that fills from `0.0` to `1.0` over the effective timeout.
 
 ## 4. Interaction (v1)
 
@@ -56,10 +57,13 @@ TOML-configurable:
 - max_visible
 - width
 - height (used as minimum popup height; final height grows with content)
-- urgency colors (`low`, `normal`, `critical`)
+- urgency colors (`low`, `normal`, `critical`) and `timeout_progress` fill color
 - per-notification padding
 - font size
 - font family
+- `show_timeout_progress`
+- `timeout_progress_height`
+- `timeout_progress_position` (`"top"` or `"bottom"`)
 
 ## 6. Reliability expectations
 

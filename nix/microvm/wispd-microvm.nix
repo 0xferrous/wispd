@@ -1,4 +1,4 @@
-{ pkgs, self, ... }:
+{ pkgs, ... }:
 {
   system.stateVersion = "25.05";
 
@@ -34,7 +34,8 @@
   environment.systemPackages = [
     pkgs.alacritty
     pkgs.libnotify
-    self.packages.${pkgs.system}.wispd
+    pkgs.wayland
+    pkgs.libxkbcommon
   ];
 
   systemd.user.services.wispd = {
@@ -43,7 +44,14 @@
     after = [ "graphical-session-pre.target" "dbus.service" ];
     wantedBy = [ "graphical-session.target" ];
     serviceConfig = {
-      ExecStart = "${self.packages.${pkgs.system}.wispd}/bin/wispd";
+      WorkingDirectory = "/work/wispd";
+      ExecStart = "/work/wispd/target/debug/wispd";
+      Environment = [
+        "LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+          pkgs.wayland
+          pkgs.libxkbcommon
+        ]}"
+      ];
       Restart = "on-failure";
       RestartSec = 1;
     };
@@ -74,6 +82,12 @@
         tag = "ro-store";
         source = "/nix/store";
         mountPoint = "/nix/.ro-store";
+      }
+      {
+        proto = "9p";
+        tag = "wispd-workspace";
+        source = ".";
+        mountPoint = "/work/wispd";
       }
     ];
 
