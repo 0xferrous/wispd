@@ -25,3 +25,10 @@
   - `wispd`
   - `wispd-ui` (optional future split frontend)
   - `wisp-debug`
+
+## Iced/frontend implementation notes
+- Prefer `iced_layershell::daemon` + `#[to_layer_message(multi)]` for multi-window notification popups (one surface per notification).
+- Avoid layer-shell protocol errors by using conservative, valid window settings (explicit non-zero size; verify anchor/layer/margin combinations).
+- Keep `wisp-source` running on a dedicated thread/runtime; UI/main thread must not block DBus service responsiveness.
+- For action buttons: ensure capability `actions` is advertised and popup height/layout accounts for action rows.
+- Transparency can be compositor-dependent; style app/root container transparent, but validate behavior on actual compositor.

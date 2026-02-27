@@ -11,6 +11,28 @@
       let
         pkgs = import nixpkgs { inherit system; };
       in {
+        packages.wispd = pkgs.rustPlatform.buildRustPackage {
+          pname = "wispd";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [
+            pkgs.wayland
+            pkgs.libxkbcommon
+          ];
+        };
+
+        packages.default = self.packages.${system}.wispd;
+
+        apps.wispd = {
+          type = "app";
+          program = "${self.packages.${system}.wispd}/bin/wispd";
+        };
+
+        apps.default = self.apps.${system}.wispd;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustc

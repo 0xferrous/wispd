@@ -144,6 +144,7 @@ struct WindowBinding {
 #[derive(Debug, Clone)]
 enum SourceCommand {
     InvokeAction { id: u32, key: String },
+    Dismiss { id: u32 },
 }
 
 #[derive(Debug)]
@@ -317,6 +318,7 @@ impl WispdUi {
 enum Message {
     Tick,
     ActionClicked { id: u32, key: String },
+    DismissClicked { id: u32 },
 }
 
 fn namespace() -> String {
@@ -333,6 +335,12 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
         Message::ActionClicked { id, key } => {
             if let Err(err) = state.cmd_tx.send(SourceCommand::InvokeAction { id, key }) {
                 warn!(?err, "failed to send action command to source thread");
+            }
+            Task::none()
+        }
+        Message::DismissClicked { id } => {
+            if let Err(err) = state.cmd_tx.send(SourceCommand::Dismiss { id }) {
+                warn!(?err, "failed to send dismiss command to source thread");
             }
             Task::none()
         }
@@ -382,7 +390,14 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
 
     let font = resolve_font(&state.ui.font_family);
 
-    let mut card_content = column![text(formatted).size(font_size).font(font)].spacing(8);
+    let close_button = button(text("✕")).on_press(Message::DismissClicked { id: n.id });
+    let header = row![
+        container(text(formatted).size(font_size).font(font)).width(Length::Fill),
+        close_button,
+    ]
+    .spacing(8);
+
+    let mut card_content = column![header].spacing(8);
 
     if !n.actions.is_empty() {
         for action_chunk in n.actions.chunks(3) {
@@ -697,6 +712,12 @@ fn main() -> Result<()> {
                                     match source_handle.invoke_action(id, &key).await {
                                         Ok(invoked) => info!(id, action_key = %key, invoked, "action command processed"),
                                         Err(err) => warn!(id, action_key = %key, ?err, "failed to process action command"),
+                                    }
+                                }
+                                SourceCommand::Dismiss { id } => {
+                                    match source_handle.close(id, wisp_types::CloseReason::Dismissed).await {
+                                        Ok(closed) => info!(id, closed, "dismiss command processed"),
+                                        Err(err) => warn!(id, ?err, "failed to process dismiss command"),
                                     }
                                 }
                             }
