@@ -118,14 +118,19 @@ Config file is loaded from:
 - `gap`
 - `padding`
 - `font_size`
-- `font_family`
+- `font_family` (alias: `font`)
 - `anchor`
+- `output` (`focused`, `last-output` sticky, `none`/`default`, or exact output name like `DP-1`)
+- `focused_output_command` (optional shell command; first stdout line used as focused output name when `output = "focused"`)
 - `margin` (`top`, `right`, `bottom`, `left`)
 - urgency colors (`low`, `normal`, `critical`) plus base `background`, `text`, and `timeout_progress`
 - timeout progress indicator controls:
   - `show_timeout_progress`
   - `timeout_progress_height`
   - `timeout_progress_position` (`top` / `bottom`)
+- click action controls:
+  - `left_click_action` (`dismiss` / `invoke-default-action`)
+  - `right_click_action` (`dismiss` / `invoke-default-action`)
 
 ## 7) Testing status
 

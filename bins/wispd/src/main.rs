@@ -3,6 +3,7 @@ use std::{
     fs,
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -12,7 +13,7 @@ use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, container, image, mouse_area, row, text};
 use iced::{Background, Color, ContentFit, Element, Font, Length, Subscription, Task, border};
 use iced_layershell::daemon;
-use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings};
+use iced_layershell::reexport::{Anchor, IcedId, Layer, NewLayerShellSettings, OutputOption};
 use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use serde::Deserialize;
@@ -68,6 +69,8 @@ struct UiSection {
     show_icons: bool,
     max_icon_size: u16,
     anchor: String,
+    output: String,
+    focused_output_command: Option<String>,
     margin: MarginConfig,
     colors: UrgencyColors,
     text: TextStyleConfig,
@@ -93,6 +96,8 @@ impl Default for UiSection {
             show_icons: true,
             max_icon_size: 32,
             anchor: "top-right".to_string(),
+            output: "focused".to_string(),
+            focused_output_command: None,
             margin: MarginConfig::default(),
             colors: UrgencyColors::default(),
             text: TextStyleConfig::default(),
@@ -341,6 +346,10 @@ impl WispdUi {
             size: Some((self.ui.width.max(1), popup_height.max(1))),
             layer: Layer::Top,
             anchor: layer_anchor_from_str(&self.ui.anchor),
+            output_option: output_option_from_config(
+                &self.ui.output,
+                self.ui.focused_output_command.as_deref(),
+            ),
             exclusive_zone: Some(0),
             margin: Some((
                 self.ui.margin.top,
@@ -1034,6 +1043,42 @@ fn layer_anchor_from_str(anchor: &str) -> Anchor {
     }
 }
 
+fn output_option_from_config(output: &str, focused_output_command: Option<&str>) -> OutputOption {
+    let trimmed = output.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    match lower.as_str() {
+        "focused" => resolve_focused_output_name(focused_output_command)
+            .map(OutputOption::OutputName)
+            .unwrap_or(OutputOption::None),
+        // Sticky output: follow last active output of this surface family.
+        "last-output" | "last_output" => OutputOption::LastOutput,
+        "any" | "none" | "default" => OutputOption::None,
+        _ if trimmed.is_empty() => OutputOption::None,
+        _ => OutputOption::OutputName(trimmed.to_string()),
+    }
+}
+
+fn resolve_focused_output_name(focused_output_command: Option<&str>) -> Option<String> {
+    let cmd = focused_output_command?.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+
+    let out = Command::new("sh").arg("-c").arg(cmd).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let name = stdout.lines().next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(name.to_string())
+}
+
 fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -1361,6 +1406,43 @@ mod tests {
         assert_eq!(
             cfg.ui.buttons.font_family.as_deref(),
             Some("Recursive Mono Casual Static")
+        );
+    }
+
+    #[test]
+    fn ui_output_defaults_to_focused() {
+        assert_eq!(AppConfig::default().ui.output, "focused");
+    }
+
+    #[test]
+    fn output_option_parses_focused() {
+        assert_eq!(
+            output_option_from_config("focused", None),
+            OutputOption::None
+        );
+    }
+
+    #[test]
+    fn output_option_parses_last_output() {
+        assert_eq!(
+            output_option_from_config("last-output", None),
+            OutputOption::LastOutput
+        );
+    }
+
+    #[test]
+    fn output_option_parses_output_name() {
+        assert_eq!(
+            output_option_from_config("DP-1", None),
+            OutputOption::OutputName("DP-1".to_string())
+        );
+    }
+
+    #[test]
+    fn output_option_uses_focused_command_when_provided() {
+        assert_eq!(
+            output_option_from_config("focused", Some("printf 'DP-3\\n'")),
+            OutputOption::OutputName("DP-3".to_string())
         );
     }
 

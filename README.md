@@ -144,6 +144,10 @@ font = "sans-serif"
 show_icons = true
 max_icon_size = 32
 anchor = "top-right"
+# focused (recommended), last-output (sticky), any/none/default, or exact output name (e.g. "DP-1")
+output = "focused"
+# optional: command that prints the currently focused output name (first line)
+# focused_output_command = "niri msg -j outputs | jq -r '.[] | select(.is_focused) | .name'"
 show_timeout_progress = true
 timeout_progress_height = 3
 timeout_progress_position = "bottom"

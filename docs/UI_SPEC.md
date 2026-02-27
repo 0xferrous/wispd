@@ -41,17 +41,19 @@ All config is TOML.
 ## 4. Interaction (v1)
 
 Implemented in v1:
-- Click notification body to dismiss.
+- Left-click and right-click actions are configurable for the notification surface.
+- Supported click actions: `dismiss` and `invoke-default-action`.
 - Render action buttons and invoke actions.
 
 Future:
-- Right-click dismiss.
 - Hover pauses timeout.
 
 ## 5. Styling/layout config (v1)
 
 TOML-configurable:
 - anchor
+- output target (`focused`, `last-output` sticky, `none`/`default`, or output name)
+- optional `focused_output_command` to resolve focused output name dynamically (first stdout line)
 - margin
 - gap
 - max_visible
@@ -64,6 +66,8 @@ TOML-configurable:
 - `show_timeout_progress`
 - `timeout_progress_height`
 - `timeout_progress_position` (`"top"` or `"bottom"`)
+- `left_click_action` (`"dismiss"` or `"invoke-default-action"`)
+- `right_click_action` (`"dismiss"` or `"invoke-default-action"`)
 
 ## 6. Reliability expectations
 
