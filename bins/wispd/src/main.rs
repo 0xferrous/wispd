@@ -904,11 +904,12 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let content_height = text_height.max(icon_height);
 
     let actions_rows = n.actions.len().div_ceil(3) as u32;
-    let action_row_height = (ui.font_size as f32 * 1.9).ceil() as u32;
+    // Keep extra slack here: iced button chrome/padding can exceed raw text line-height.
+    let action_row_height = (ui.font_size as f32 * 2.2).ceil() as u32;
     let actions_height = if actions_rows == 0 {
         0
     } else {
-        actions_rows * action_row_height + 8
+        actions_rows * action_row_height + 12
     };
 
     let progress_height = if ui.show_timeout_progress && n.timeout_ms.is_some() {
@@ -917,7 +918,8 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
         0
     };
 
-    let chrome = ui.padding as u32 * 2 + 10 + progress_height;
+    let action_bottom_slack = if actions_rows > 0 { 4 } else { 0 };
+    let chrome = ui.padding as u32 * 2 + 10 + progress_height + action_bottom_slack;
 
     content_height
         .saturating_add(actions_height)
