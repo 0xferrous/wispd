@@ -2,7 +2,7 @@
 
 - Keep docs concise; avoid verbose planning text.
 - Keep docs up to date with code changes.
-- Keep `ARCHITECTURE.md` updated as a living implementation-oriented doc (especially D-Bus flow and component responsibilities).
+- Keep `docs/ARCHITECTURE.md` updated as a living implementation-oriented doc (especially D-Bus flow and component responsibilities).
 - Make regular commits using Conventional Commits.
 - Prefer tested code: add/update tests with implementation changes and run the relevant test suite.
 - Public APIs in library crates should generally include doc comments for useful generated docs/docs.rs output.
