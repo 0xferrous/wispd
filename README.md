@@ -11,6 +11,24 @@ It includes:
   - `wisp-source` (D-Bus server + notification lifecycle)
   - `wisp-types` (shared notification/event types)
 
+## Table of contents
+
+- [Current status](#current-status)
+- [freedesktop.org Notifications API coverage](#freedesktoporg-notifications-api-coverage)
+  - [Core D-Bus methods](#core-d-bus-methods)
+  - [D-Bus signals](#d-bus-signals)
+  - [Behavior/details](#behaviordetails)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+  - [1) Run debug daemon (easiest first test)](#1-run-debug-daemon-easiest-first-test)
+  - [2) Run UI daemon](#2-run-ui-daemon)
+  - [3) Run passive monitor (no name ownership)](#3-run-passive-monitor-no-name-ownership)
+  - [4) Forward host notifications into VM (while keeping host mako)](#4-forward-host-notifications-into-vm-while-keeping-host-mako)
+- [Configuration](#configuration)
+- [Home Manager module](#home-manager-module)
+- [Niri + wispd MicroVM (QEMU)](#niri--wispd-microvm-qemu)
+- [Development](#development)
+
 ## Current status
 
 Early-stage but functional:
