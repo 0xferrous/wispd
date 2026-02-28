@@ -564,7 +564,7 @@ fn parse_hints(hints: &HashMap<String, zvariant::OwnedValue>) -> (Urgency, Notif
                 && key.as_str() != "desktop-entry"
                 && key.as_str() != "transient"
         })
-        .map(|(key, value)| (key.clone(), format!("{value:?}")))
+        .map(|(key, value)| (key.clone(), format_hint_value(key, value)))
         .collect();
 
     (
@@ -576,6 +576,19 @@ fn parse_hints(hints: &HashMap<String, zvariant::OwnedValue>) -> (Urgency, Notif
             extra,
         },
     )
+}
+
+fn format_hint_value(key: &str, value: &zvariant::OwnedValue) -> String {
+    if matches!(key, "image-data" | "image_data" | "icon_data") {
+        return "<omitted image payload>".to_string();
+    }
+
+    let signature = value.value_signature().to_string();
+    if signature.contains("ay") {
+        return format!("<omitted binary payload signature={signature}>");
+    }
+
+    format!("{value:?}")
 }
 
 fn close_reason_code(reason: CloseReason) -> u32 {
@@ -622,6 +635,36 @@ mod tests {
             }],
             hints: NotificationHints::default(),
         }
+    }
+
+    #[test]
+    fn image_hints_are_omitted_from_extra_debug_dump() {
+        let mut raw_hints: HashMap<String, zvariant::OwnedValue> = HashMap::new();
+        raw_hints.insert("image-data".to_string(), true.into());
+        raw_hints.insert("suppress-sound".to_string(), false.into());
+        raw_hints.insert(
+            "blob".to_string(),
+            zvariant::OwnedValue::try_from(zvariant::Value::from(vec![1_u8, 2, 3])).unwrap(),
+        );
+
+        let (_urgency, hints) = parse_hints(&raw_hints);
+
+        assert_eq!(
+            hints.extra.get("image-data").map(String::as_str),
+            Some("<omitted image payload>")
+        );
+        assert!(
+            hints
+                .extra
+                .get("blob")
+                .is_some_and(|v| v.contains("<omitted binary payload signature=ay>"))
+        );
+        assert!(
+            hints
+                .extra
+                .get("suppress-sound")
+                .is_some_and(|v| v.contains("Bool(false)"))
+        );
     }
 
     #[tokio::test]
