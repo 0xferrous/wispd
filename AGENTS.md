@@ -31,4 +31,5 @@
 - Avoid layer-shell protocol errors by using conservative, valid window settings (explicit non-zero size; verify anchor/layer/margin combinations).
 - Keep `wisp-source` running on a dedicated thread/runtime; UI/main thread must not block DBus service responsiveness.
 - For action buttons: ensure capability `actions` is advertised and popup height/layout accounts for action rows.
+- Keep render-time predicates and measurement-time predicates in shared helpers (single source of truth) to avoid layout/render divergence regressions.
 - Transparency can be compositor-dependent; style app/root container transparent, but validate behavior on actual compositor.

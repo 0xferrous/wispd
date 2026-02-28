@@ -854,10 +854,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     }
 
     let mut content_row = row![].spacing(10);
-    if state.ui.show_icons
-        && let Some(path) = resolve_icon_path(&n.app_icon)
-        && path.is_file()
-    {
+    if let Some(path) = renderable_icon_path(state.ui.show_icons, &n.app_icon) {
         let icon_size = state.ui.max_icon_size.max(1) as f32;
         let icon = image(iced::widget::image::Handle::from_path(path))
             .width(Length::Fixed(icon_size))
@@ -874,7 +871,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     let body = container(content_row)
         .padding(card_padding)
         .width(Length::Fill)
-        .height(Length::Fill)
+        .height(Length::Shrink)
         .style(move |_| iced::widget::container::Style::default().color(text_color));
 
     let timeout_progress = state
@@ -884,7 +881,9 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     let progress_height = state.ui.timeout_progress_height.max(1) as f32;
 
     let card_stack = if let Some(progress) = timeout_progress {
-        let fill_width = (card_width * progress).max(0.0);
+        let progress_track_width = (card_width - (card_padding as f32 * 2.0)).max(1.0);
+        let fill_width = (progress_track_width * progress).clamp(0.0, progress_track_width);
+        let empty_width = (progress_track_width - fill_width).max(0.0);
         let fill = container(text(""))
             .width(Length::Fixed(fill_width))
             .height(Length::Fixed(progress_height))
@@ -893,22 +892,33 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
                     .background(Background::Color(progress_color))
             });
         let empty = container(text(""))
-            .width(Length::Fill)
+            .width(Length::Fixed(empty_width))
             .height(Length::Fixed(progress_height))
             .style(|_| {
                 iced::widget::container::Style::default()
                     .background(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.08)))
             });
-        let progress_bar = row![fill, empty].spacing(0);
+        let progress_bar = row![fill, empty]
+            .width(Length::Fixed(progress_track_width))
+            .spacing(0);
+        let progress_top_gap = (card_padding / 2).max(2) as f32;
+        let progress_bottom_gap = (card_padding / 2).max(2) as f32;
+        let progress_bar_inset = container(column![
+            container(text("")).height(Length::Fixed(progress_top_gap)),
+            progress_bar,
+            container(text("")).height(Length::Fixed(progress_bottom_gap))
+        ])
+        .width(Length::Fill)
+        .padding([0, card_padding]);
 
         if state
             .ui
             .timeout_progress_position
             .eq_ignore_ascii_case("top")
         {
-            column![progress_bar, body]
+            column![progress_bar_inset, body]
         } else {
-            column![body, progress_bar]
+            column![body, progress_bar_inset]
         }
     } else {
         column![body]
@@ -1000,6 +1010,27 @@ fn resolve_icon_path(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
+fn renderable_icon_path(show_icons: bool, app_icon: &str) -> Option<PathBuf> {
+    if !show_icons {
+        return None;
+    }
+
+    let path = resolve_icon_path(app_icon)?;
+    if !path.is_file() {
+        return None;
+    }
+
+    Some(path)
+}
+
+fn icon_height_px(ui: &UiSection, app_icon: &str) -> u32 {
+    if renderable_icon_path(ui.show_icons, app_icon).is_some() {
+        ui.max_icon_size.max(1) as u32
+    } else {
+        0
+    }
+}
+
 fn style_button(
     status: ButtonStatus,
     background: Color,
@@ -1036,7 +1067,22 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let summary_size = ui.text.summary.font_size.unwrap_or(ui.font_size) as f32;
     let body_size = ui.text.body.font_size.unwrap_or(ui.font_size) as f32;
 
-    let content_width_px = (ui.width as f32 - (ui.padding as f32 * 2.0)).max(80.0);
+    let icon_height = icon_height_px(ui, &n.app_icon);
+    let icon_width = if icon_height > 0 {
+        ui.max_icon_size.max(1) as f32 + 10.0 // icon + row spacing
+    } else {
+        0.0
+    };
+
+    let close_button_font_size = ui.buttons.close_font_size.unwrap_or(
+        ui.buttons
+            .font_size
+            .unwrap_or(ui.font_size.saturating_sub(2)),
+    ) as f32;
+    let close_button_width = (close_button_font_size * 0.8) + 14.0; // glyph + horizontal padding/border
+
+    let content_width_px = (ui.width as f32 - (ui.padding as f32 * 2.0) - icon_width).max(80.0);
+    let text_width_px = (content_width_px - close_button_width - 8.0).max(40.0);
 
     let header_text = match (n.app_name.trim().is_empty(), n.summary.trim().is_empty()) {
         (false, false) => format!("{} {}", n.app_name, n.summary),
@@ -1047,7 +1093,7 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
 
     let header_font_size = app_name_size.max(summary_size).max(1.0);
     let header_char_width = (header_font_size * 0.54).max(1.0);
-    let header_chars_per_line = (content_width_px / header_char_width).floor().max(1.0) as usize;
+    let header_chars_per_line = (text_width_px / header_char_width).floor().max(1.0) as usize;
     let header_wrapped_lines = if header_text.is_empty() {
         0
     } else {
@@ -1057,7 +1103,7 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let header_height = header_wrapped_lines as u32 * header_line_height;
 
     let body_char_width = (body_size * 0.54).max(1.0);
-    let body_chars_per_line = (content_width_px / body_char_width).floor().max(1.0) as usize;
+    let body_chars_per_line = (text_width_px / body_char_width).floor().max(1.0) as usize;
     let body_wrapped_lines = if n.body.trim().is_empty() {
         0
     } else {
@@ -1078,12 +1124,8 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let text_height = header_height
         .saturating_add(body_height)
         .saturating_add(text_internal_spacing);
-    let icon_height = if ui.show_icons && resolve_icon_path(&n.app_icon).is_some() {
-        ui.max_icon_size.max(1) as u32
-    } else {
-        0
-    };
-    let content_height = text_height.max(icon_height);
+    let close_button_height = (close_button_font_size * 1.30).ceil() as u32 + 4;
+    let content_height = text_height.max(close_button_height).max(icon_height);
 
     let actions_rows = n.actions.len().div_ceil(3) as u32;
     // Button widget chrome/padding can exceed raw text line-height.
@@ -1100,8 +1142,15 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     } else {
         0
     };
+    let (progress_top_inset, progress_bottom_inset) = if progress_height > 0 {
+        let gap = (ui.padding / 2).max(2) as u32;
+        (gap, gap)
+    } else {
+        (0, 0)
+    };
 
-    let chrome = ui.padding as u32 * 2 + progress_height + 2;
+    let chrome =
+        ui.padding as u32 * 2 + progress_height + progress_top_inset + progress_bottom_inset + 2;
 
     content_height
         .saturating_add(actions_height)
@@ -1641,6 +1690,22 @@ mod tests {
             resolve_icon_path("file:///tmp/icon.png"),
             Some(PathBuf::from("/tmp/icon.png"))
         );
+    }
+
+    #[test]
+    fn renderable_icon_path_requires_existing_file() {
+        assert!(renderable_icon_path(true, "kitty").is_none());
+    }
+
+    #[test]
+    fn icon_height_is_zero_when_icon_is_not_renderable() {
+        let ui = UiSection {
+            show_icons: true,
+            max_icon_size: 32,
+            ..UiSection::default()
+        };
+
+        assert_eq!(icon_height_px(&ui, "kitty"), 0);
     }
 
     #[test]
