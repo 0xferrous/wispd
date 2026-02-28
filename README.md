@@ -137,6 +137,12 @@ Config file path:
 - `$XDG_CONFIG_HOME/wispd/config.toml`
 - fallback: `~/.config/wispd/config.toml`
 
+Runtime reload:
+
+- Send `SIGHUP` to `wispd` to reload config without restarting:
+  - `pkill -HUP -x wispd`
+  - or `systemctl --user kill -s HUP wispd`
+
 Example:
 
 `left_click_action` / `right_click_action` allowed values:

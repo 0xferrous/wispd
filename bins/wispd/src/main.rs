@@ -259,13 +259,23 @@ struct WindowBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceCommand {
-    InvokeAction { id: u32, key: String },
-    Dismiss { id: u32 },
+    InvokeAction {
+        id: u32,
+        key: String,
+    },
+    Dismiss {
+        id: u32,
+    },
+    ReloadConfig {
+        capabilities: Vec<String>,
+        default_timeout_ms: Option<i32>,
+    },
 }
 
 #[derive(Debug)]
 struct WispdUi {
     events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
+    reload_rx: Arc<Mutex<mpsc::Receiver<()>>>,
     cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
     notifications: HashMap<u32, UiNotification>,
     windows: VecDeque<WindowBinding>,
@@ -278,12 +288,14 @@ struct WispdUi {
 impl WispdUi {
     fn new(
         events: Arc<Mutex<mpsc::Receiver<NotificationEvent>>>,
+        reload_rx: Arc<Mutex<mpsc::Receiver<()>>>,
         cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
         ui: UiSection,
         default_timeout_ms: Option<i32>,
     ) -> Self {
         Self {
             events,
+            reload_rx,
             cmd_tx,
             notifications: HashMap::new(),
             windows: VecDeque::new(),
@@ -296,6 +308,20 @@ impl WispdUi {
 
     fn on_tick(&mut self) -> Task<Message> {
         let mut pending = Vec::new();
+        let mut reload_requested = false;
+
+        if let Ok(reload_rx) = self.reload_rx.lock() {
+            loop {
+                match reload_rx.try_recv() {
+                    Ok(()) => reload_requested = true,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        warn!("reload channel disconnected");
+                        break;
+                    }
+                }
+            }
+        }
 
         if let Ok(receiver) = self.events.lock() {
             loop {
@@ -312,6 +338,10 @@ impl WispdUi {
 
         let processed = pending.len();
         let mut tasks = Vec::new();
+
+        if reload_requested {
+            tasks.push(self.reload_config());
+        }
         for event in pending {
             tasks.push(self.apply_event(event));
         }
@@ -479,6 +509,39 @@ impl WispdUi {
         if let Err(err) = self.cmd_tx.send(cmd) {
             warn!(?err, "failed to send click action command to source thread");
         }
+    }
+
+    fn reload_config(&mut self) -> Task<Message> {
+        let cfg = load_config();
+        info!("runtime config reload requested");
+        self.apply_config(cfg)
+    }
+
+    fn apply_config(&mut self, cfg: AppConfig) -> Task<Message> {
+        if let Err(err) = self.cmd_tx.send(SourceCommand::ReloadConfig {
+            capabilities: cfg.source.capabilities.clone(),
+            default_timeout_ms: cfg.source.default_timeout_ms,
+        }) {
+            warn!(?err, "failed to send source reload command");
+        }
+
+        self.ui = cfg.ui;
+        self.default_timeout_ms = cfg.source.default_timeout_ms;
+
+        self.measured_heights.clear();
+        self.pending_measure
+            .extend(self.notifications.keys().copied());
+
+        let mut tasks = Vec::new();
+        while self.windows.len() > self.ui.max_visible {
+            if let Some(evicted) = self.windows.pop_back() {
+                self.notifications.remove(&evicted.notification_id);
+                tasks.push(Task::done(Message::RemoveWindow(evicted.window_id)));
+            }
+        }
+
+        tasks.push(self.relayout_task());
+        Task::batch(tasks)
     }
 }
 
@@ -1250,6 +1313,50 @@ fn load_config() -> AppConfig {
     }
 }
 
+#[cfg(unix)]
+fn spawn_reload_signal_listener(reload_tx: mpsc::Sender<()>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("wispd-reload-signal".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    warn!(?err, "failed to build signal listener runtime");
+                    return;
+                }
+            };
+
+            runtime.block_on(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+
+                let mut hup = match signal(SignalKind::hangup()) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        warn!(?err, "failed to subscribe to SIGHUP");
+                        return;
+                    }
+                };
+
+                info!("listening for SIGHUP to reload config");
+                while hup.recv().await.is_some() {
+                    if reload_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        })
+        .map(|_| ())
+        .map_err(|err| anyhow!("failed to spawn reload signal listener: {err}"))
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_signal_listener(_: mpsc::Sender<()>) -> Result<()> {
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -1262,6 +1369,7 @@ fn main() -> Result<()> {
     };
 
     let (ui_tx, ui_rx) = mpsc::channel::<NotificationEvent>();
+    let (reload_tx, reload_rx) = mpsc::channel::<()>();
     let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<SourceCommand>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<SourceConfig, String>>();
 
@@ -1325,6 +1433,13 @@ fn main() -> Result<()> {
                                         Err(err) => warn!(id, ?err, "failed to process dismiss command"),
                                     }
                                 }
+                                SourceCommand::ReloadConfig {
+                                    capabilities,
+                                    default_timeout_ms,
+                                } => {
+                                    source_handle.update_runtime_config(capabilities, default_timeout_ms);
+                                    info!(default_timeout_ms, "source runtime config updated");
+                                }
                             }
                         }
                     }
@@ -1335,6 +1450,8 @@ fn main() -> Result<()> {
             });
         })
         .map_err(|err| anyhow!("failed to spawn source thread: {err}"))?;
+
+    spawn_reload_signal_listener(reload_tx)?;
 
     let source_runtime_cfg = match ready_rx.recv_timeout(Duration::from_secs(3)) {
         Ok(Ok(cfg)) => cfg,
@@ -1349,7 +1466,9 @@ fn main() -> Result<()> {
     );
 
     let events = Arc::new(Mutex::new(ui_rx));
+    let reloads = Arc::new(Mutex::new(reload_rx));
     let boot_events = Arc::clone(&events);
+    let boot_reloads = Arc::clone(&reloads);
     let ui_cfg = app_cfg.ui.clone();
     let ui_default_timeout_ms = app_cfg.source.default_timeout_ms;
     let boot_cmd_tx = cmd_tx.clone();
@@ -1372,6 +1491,7 @@ fn main() -> Result<()> {
         move || {
             WispdUi::new(
                 Arc::clone(&boot_events),
+                Arc::clone(&boot_reloads),
                 boot_cmd_tx.clone(),
                 ui_cfg.clone(),
                 ui_default_timeout_ms,
@@ -1420,11 +1540,32 @@ mod tests {
         }
     }
 
+    fn test_ui(
+        ui: UiSection,
+    ) -> (
+        WispdUi,
+        tokio_mpsc::UnboundedReceiver<SourceCommand>,
+        mpsc::Sender<()>,
+    ) {
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (reload_tx, reload_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
+        (
+            WispdUi::new(
+                Arc::new(Mutex::new(event_rx)),
+                Arc::new(Mutex::new(reload_rx)),
+                cmd_tx,
+                ui,
+                None,
+            ),
+            cmd_rx,
+            reload_tx,
+        )
+    }
+
     #[test]
     fn newest_goes_to_front() {
-        let (_tx, rx) = mpsc::channel();
-        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -1436,9 +1577,7 @@ mod tests {
 
     #[test]
     fn replacement_keeps_slot() {
-        let (_tx, rx) = mpsc::channel();
-        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(sample(2, "two"));
@@ -1457,9 +1596,7 @@ mod tests {
 
     #[test]
     fn close_removes_notification() {
-        let (_tx, rx) = mpsc::channel();
-        let (cmd_tx, _cmd_rx) = tokio_mpsc::unbounded_channel();
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, UiSection::default(), None);
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
 
         let _ = ui.apply_event(sample(1, "one"));
         let _ = ui.apply_event(NotificationEvent::Closed {
@@ -1604,13 +1741,11 @@ mod tests {
 
     #[test]
     fn left_click_can_invoke_default_action() {
-        let (_tx, rx) = mpsc::channel();
-        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
         let ui_cfg = UiSection {
             left_click_action: ClickAction::InvokeDefaultAction,
             ..UiSection::default()
         };
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, ui_cfg, None);
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(ui_cfg);
 
         let _ = update(&mut ui, Message::NotificationLeftClick { id: 42 });
 
@@ -1624,14 +1759,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_config_updates_ui_and_source_runtime_values() {
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        let mut cfg = AppConfig::default();
+        cfg.source.capabilities = vec!["body".to_string(), "actions".to_string()];
+        cfg.source.default_timeout_ms = Some(4_200);
+        cfg.ui.max_visible = 2;
+
+        let _ = ui.apply_config(cfg);
+
+        assert_eq!(ui.default_timeout_ms, Some(4_200));
+        assert_eq!(ui.ui.max_visible, 2);
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            SourceCommand::ReloadConfig {
+                capabilities: vec!["body".to_string(), "actions".to_string()],
+                default_timeout_ms: Some(4_200),
+            }
+        );
+    }
+
+    #[test]
     fn right_click_can_dismiss() {
-        let (_tx, rx) = mpsc::channel();
-        let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel();
         let ui_cfg = UiSection {
             right_click_action: ClickAction::Dismiss,
             ..UiSection::default()
         };
-        let mut ui = WispdUi::new(Arc::new(Mutex::new(rx)), cmd_tx, ui_cfg, None);
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(ui_cfg);
 
         let _ = update(&mut ui, Message::NotificationRightClick { id: 11 });
 

@@ -139,6 +139,11 @@ Config file is loaded from:
   - `left_click_action` (`dismiss` / `invoke-default-action`)
   - `right_click_action` (`dismiss` / `invoke-default-action`)
 
+Runtime reload:
+- `wispd` listens for `SIGHUP`.
+- On `SIGHUP`, it reloads `config.toml` and applies updated UI settings in place.
+- Source runtime settings (`capabilities`, `default_timeout_ms`) are updated without restarting D-Bus ownership.
+
 ## 7) Testing status
 
 Implemented tests in `wisp-source`:

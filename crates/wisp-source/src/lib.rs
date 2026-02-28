@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU32, Ordering},
     },
     time::Duration,
@@ -10,7 +10,7 @@ use std::{
 use thiserror::Error;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock as AsyncRwLock, mpsc};
 use tracing::{debug, info, warn};
 use wisp_types::{
     CloseReason, Notification, NotificationAction, NotificationEvent, NotificationHints, Urgency,
@@ -90,10 +90,12 @@ pub struct WispSource {
 #[derive(Debug)]
 struct Inner {
     cfg: SourceConfig,
+    capabilities: RwLock<Vec<String>>,
+    default_timeout_ms: RwLock<Option<i32>>,
     sender: mpsc::Sender<NotificationEvent>,
     notifications: Mutex<HashMap<u32, StoredNotification>>,
     next_id: AtomicU32,
-    dbus_connection: RwLock<Option<zbus::Connection>>,
+    dbus_connection: AsyncRwLock<Option<zbus::Connection>>,
     runtime_handle: Option<Handle>,
 }
 
@@ -122,11 +124,13 @@ impl WispSource {
         let (sender, receiver) = mpsc::channel(cfg.channel_capacity);
         let source = Self {
             inner: Arc::new(Inner {
+                capabilities: RwLock::new(cfg.capabilities.clone()),
+                default_timeout_ms: RwLock::new(cfg.default_timeout_ms),
                 cfg,
                 sender,
                 notifications: Mutex::new(HashMap::new()),
                 next_id: AtomicU32::new(1),
-                dbus_connection: RwLock::new(None),
+                dbus_connection: AsyncRwLock::new(None),
                 runtime_handle: Handle::try_current().ok(),
             }),
         };
@@ -160,8 +164,30 @@ impl WispSource {
     }
 
     /// Returns currently advertised freedesktop capabilities.
-    pub fn capabilities(&self) -> &[String] {
-        &self.inner.cfg.capabilities
+    pub fn capabilities(&self) -> Vec<String> {
+        self.inner
+            .capabilities
+            .read()
+            .expect("capabilities lock poisoned")
+            .clone()
+    }
+
+    /// Updates runtime-configurable source values.
+    pub fn update_runtime_config(
+        &self,
+        capabilities: Vec<String>,
+        default_timeout_ms: Option<i32>,
+    ) {
+        *self
+            .inner
+            .capabilities
+            .write()
+            .expect("capabilities lock poisoned") = capabilities;
+        *self
+            .inner
+            .default_timeout_ms
+            .write()
+            .expect("default timeout lock poisoned") = default_timeout_ms;
     }
 
     /// Inserts or replaces a notification and emits the corresponding event.
@@ -338,9 +364,15 @@ impl WispSource {
     }
 
     fn effective_timeout_duration(&self, requested_timeout_ms: i32) -> Option<Duration> {
+        let default_timeout_ms = *self
+            .inner
+            .default_timeout_ms
+            .read()
+            .expect("default timeout lock poisoned");
+
         let effective_ms = match requested_timeout_ms {
             0 => return None,
-            x if x < 0 => self.inner.cfg.default_timeout_ms?,
+            x if x < 0 => default_timeout_ms?,
             x => x,
         };
 
@@ -501,7 +533,7 @@ impl NotificationsInterface {
     }
 
     fn get_capabilities(&self) -> Vec<String> {
-        self.source.capabilities().to_vec()
+        self.source.capabilities()
     }
 
     fn get_server_information(&self) -> (String, String, String, String) {
