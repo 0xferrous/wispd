@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     path::PathBuf,
@@ -9,9 +9,12 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use iced::advanced::widget as adv_widget;
 use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, container, image, mouse_area, row, text};
-use iced::{Background, Color, ContentFit, Element, Font, Length, Subscription, Task, border};
+use iced::{
+    Background, Color, ContentFit, Element, Font, Length, Rectangle, Subscription, Task, border,
+};
 use iced_layershell::daemon;
 use iced_layershell::reexport::{
     Anchor, IcedId, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption,
@@ -266,6 +269,8 @@ struct WispdUi {
     cmd_tx: tokio_mpsc::UnboundedSender<SourceCommand>,
     notifications: HashMap<u32, UiNotification>,
     windows: VecDeque<WindowBinding>,
+    measured_heights: HashMap<u32, u32>,
+    pending_measure: HashSet<u32>,
     ui: UiSection,
     default_timeout_ms: Option<i32>,
 }
@@ -282,6 +287,8 @@ impl WispdUi {
             cmd_tx,
             notifications: HashMap::new(),
             windows: VecDeque::new(),
+            measured_heights: HashMap::new(),
+            pending_measure: HashSet::new(),
             ui,
             default_timeout_ms,
         }
@@ -313,6 +320,10 @@ impl WispdUi {
             info!(processed, visible = self.windows.len(), "ui state updated");
         }
 
+        for id in self.pending_measure.iter().copied() {
+            tasks.push(measure_notification_height_task(id));
+        }
+
         Task::batch(tasks)
     }
 
@@ -324,7 +335,9 @@ impl WispdUi {
                     id,
                     to_ui_notification(id, *current, self.default_timeout_ms),
                 );
-                Task::none()
+                self.measured_heights.remove(&id);
+                self.pending_measure.insert(id);
+                self.relayout_task()
             }
             NotificationEvent::Closed { id, .. } => self.remove_notification(id),
             NotificationEvent::ActionInvoked { .. } => Task::none(),
@@ -336,6 +349,8 @@ impl WispdUi {
             id,
             to_ui_notification(id, notification, self.default_timeout_ms),
         );
+        self.measured_heights.remove(&id);
+        self.pending_measure.insert(id);
 
         if self.windows.iter().any(|w| w.notification_id == id) {
             return Task::none();
@@ -382,6 +397,8 @@ impl WispdUi {
 
     fn remove_notification(&mut self, id: u32) -> Task<Message> {
         self.notifications.remove(&id);
+        self.measured_heights.remove(&id);
+        self.pending_measure.remove(&id);
 
         if let Some(index) = self.windows.iter().position(|w| w.notification_id == id)
             && let Some(binding) = self.windows.remove(index)
@@ -432,6 +449,10 @@ impl WispdUi {
     }
 
     fn popup_height_for_id(&self, id: u32) -> u32 {
+        if let Some(measured) = self.measured_heights.get(&id) {
+            return (*measured).max(self.ui.height.max(1));
+        }
+
         self.notifications
             .get(&id)
             .map(|n| estimate_popup_height(&self.ui, n))
@@ -469,6 +490,7 @@ enum Message {
     DismissClicked { id: u32 },
     NotificationLeftClick { id: u32 },
     NotificationRightClick { id: u32 },
+    MeasuredPopupHeight { id: u32, height: Option<u32> },
 }
 
 fn namespace() -> String {
@@ -502,6 +524,23 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
             state.dispatch_click_action(id, state.ui.right_click_action);
             Task::none()
         }
+        Message::MeasuredPopupHeight { id, height } => {
+            let Some(height) = height else {
+                return Task::none();
+            };
+
+            let snapped = height.max(state.ui.height.max(1));
+            let changed = state.measured_heights.get(&id).copied() != Some(snapped);
+
+            state.measured_heights.insert(id, snapped);
+            state.pending_measure.remove(&id);
+
+            if changed {
+                state.relayout_task()
+            } else {
+                Task::none()
+            }
+        }
         _ => Task::none(),
     }
 }
@@ -510,6 +549,52 @@ fn app_style(_state: &WispdUi, theme: &iced::Theme) -> iced::theme::Style {
     iced::theme::Style {
         background_color: Color::TRANSPARENT,
         text_color: theme.palette().text,
+    }
+}
+
+fn popup_content_widget_id(id: u32) -> adv_widget::Id {
+    adv_widget::Id::from(format!("popup-content-{id}"))
+}
+
+fn measure_notification_height_task(id: u32) -> Task<Message> {
+    iced::advanced::widget::operate(FindWidgetBounds::new(popup_content_widget_id(id))).map(
+        move |bounds| Message::MeasuredPopupHeight {
+            id,
+            height: bounds.map(|rect| rect.height.ceil() as u32),
+        },
+    )
+}
+
+struct FindWidgetBounds {
+    target: adv_widget::Id,
+    found: Option<Rectangle>,
+}
+
+impl FindWidgetBounds {
+    fn new(target: adv_widget::Id) -> Self {
+        Self {
+            target,
+            found: None,
+        }
+    }
+}
+
+impl adv_widget::Operation<Option<Rectangle>> for FindWidgetBounds {
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn adv_widget::Operation<Option<Rectangle>>),
+    ) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&adv_widget::Id>, bounds: Rectangle) {
+        if id.is_some_and(|id| id == &self.target) {
+            self.found = Some(bounds);
+        }
+    }
+
+    fn finish(&self) -> adv_widget::operation::Outcome<Option<Rectangle>> {
+        adv_widget::operation::Outcome::Some(self.found)
     }
 }
 
@@ -536,17 +621,30 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
             .into();
     };
 
-    let border_color = urgency_color(&state.ui.colors, n.urgency.clone());
-    let bg_color = parse_hex_color(&state.ui.colors.background)
+    let is_measuring = state.pending_measure.contains(&n.id);
+
+    let mut border_color = urgency_color(&state.ui.colors, n.urgency.clone());
+    let mut bg_color = parse_hex_color(&state.ui.colors.background)
         .unwrap_or(Color::from_rgba(0.12, 0.12, 0.18, 0.8));
-    let text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
-    let progress_color = parse_hex_color(&state.ui.colors.timeout_progress).unwrap_or(text_color);
-    let app_name_color = parse_hex_color(&state.ui.text.app_name.color).unwrap_or(text_color);
-    let summary_color = parse_hex_color(&state.ui.text.summary.color).unwrap_or(text_color);
-    let body_color = parse_hex_color(&state.ui.text.body.color).unwrap_or(text_color);
+    let mut text_color = parse_hex_color(&state.ui.colors.text).unwrap_or(Color::WHITE);
+    let mut progress_color =
+        parse_hex_color(&state.ui.colors.timeout_progress).unwrap_or(text_color);
+    let mut app_name_color = parse_hex_color(&state.ui.text.app_name.color).unwrap_or(text_color);
+    let mut summary_color = parse_hex_color(&state.ui.text.summary.color).unwrap_or(text_color);
+    let mut body_color = parse_hex_color(&state.ui.text.body.color).unwrap_or(text_color);
+
+    if is_measuring {
+        border_color = Color::TRANSPARENT;
+        bg_color = Color::TRANSPARENT;
+        text_color = Color::TRANSPARENT;
+        progress_color = Color::TRANSPARENT;
+        app_name_color = Color::TRANSPARENT;
+        summary_color = Color::TRANSPARENT;
+        body_color = Color::TRANSPARENT;
+    }
 
     let card_width = state.ui.width as f32;
-    let card_height = estimate_popup_height(&state.ui, n) as f32;
+    let card_height = state.popup_height_for_id(n.id) as f32;
     let card_padding = state.ui.padding;
 
     let app_name_size = state
@@ -565,16 +663,24 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
 
     let font = resolve_font(&state.ui.font_family);
 
-    let button_text_color =
+    let mut button_text_color =
         parse_hex_color(&state.ui.buttons.text_color).unwrap_or(Color::from_rgb8(0xeb, 0xdb, 0xb2));
-    let button_bg_color =
+    let mut button_bg_color =
         parse_hex_color(&state.ui.buttons.background).unwrap_or(Color::from_rgb8(0x3c, 0x38, 0x36));
-    let button_border_color = parse_hex_color(&state.ui.buttons.border_color)
+    let mut button_border_color = parse_hex_color(&state.ui.buttons.border_color)
         .unwrap_or(Color::from_rgb8(0x66, 0x5c, 0x54));
-    let button_hover_bg_color = parse_hex_color(&state.ui.buttons.hover_background)
+    let mut button_hover_bg_color = parse_hex_color(&state.ui.buttons.hover_background)
         .unwrap_or(Color::from_rgb8(0x50, 0x49, 0x45));
-    let button_hover_text_color = parse_hex_color(&state.ui.buttons.hover_text_color)
+    let mut button_hover_text_color = parse_hex_color(&state.ui.buttons.hover_text_color)
         .unwrap_or(Color::from_rgb8(0xfb, 0xf1, 0xc7));
+
+    if is_measuring {
+        button_text_color = Color::TRANSPARENT;
+        button_bg_color = Color::TRANSPARENT;
+        button_border_color = Color::TRANSPARENT;
+        button_hover_bg_color = Color::TRANSPARENT;
+        button_hover_text_color = Color::TRANSPARENT;
+    }
 
     let button_font = state
         .ui
@@ -746,6 +852,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
     };
 
     let card = container(card_stack)
+        .id(popup_content_widget_id(n.id))
         .width(Length::Fixed(card_width))
         .height(Length::Fixed(card_height))
         .style(move |_| {
@@ -754,11 +861,16 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
                 .border(border::width(2).color(border_color))
         });
 
-    let clickable_card = mouse_area(card)
-        .on_press(Message::NotificationLeftClick { id: n.id })
-        .on_right_press(Message::NotificationRightClick { id: n.id });
+    let content: Element<'_, Message> = if is_measuring {
+        card.into()
+    } else {
+        mouse_area(card)
+            .on_press(Message::NotificationLeftClick { id: n.id })
+            .on_right_press(Message::NotificationRightClick { id: n.id })
+            .into()
+    };
 
-    container(column![clickable_card])
+    container(column![content])
         .width(Length::Shrink)
         .style(|_| {
             iced::widget::container::Style::default()
@@ -895,7 +1007,14 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let body_line_height = (body_size * 1.30).ceil() as u32;
     let body_height = body_wrapped_lines as u32 * body_line_height;
 
-    let text_height = header_height.saturating_add(body_height);
+    let text_internal_spacing = if header_height > 0 && body_height > 0 {
+        2
+    } else {
+        0
+    };
+    let text_height = header_height
+        .saturating_add(body_height)
+        .saturating_add(text_internal_spacing);
     let icon_height = if ui.show_icons && resolve_icon_path(&n.app_icon).is_some() {
         ui.max_icon_size.max(1) as u32
     } else {
@@ -904,12 +1023,13 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
     let content_height = text_height.max(icon_height);
 
     let actions_rows = n.actions.len().div_ceil(3) as u32;
-    // Keep extra slack here: iced button chrome/padding can exceed raw text line-height.
-    let action_row_height = (ui.font_size as f32 * 2.2).ceil() as u32;
+    // Button widget chrome/padding can exceed raw text line-height.
+    let action_row_height = (ui.font_size as f32 * 2.0).ceil() as u32;
     let actions_height = if actions_rows == 0 {
         0
     } else {
-        actions_rows * action_row_height + 12
+        let row_gaps = 8 * actions_rows; // header->row1 plus gaps between action rows
+        actions_rows * action_row_height + row_gaps + 2
     };
 
     let progress_height = if ui.show_timeout_progress && n.timeout_ms.is_some() {
@@ -918,8 +1038,7 @@ fn estimate_popup_height(ui: &UiSection, n: &UiNotification) -> u32 {
         0
     };
 
-    let action_bottom_slack = if actions_rows > 0 { 4 } else { 0 };
-    let chrome = ui.padding as u32 * 2 + 10 + progress_height + action_bottom_slack;
+    let chrome = ui.padding as u32 * 2 + progress_height + 2;
 
     content_height
         .saturating_add(actions_height)
