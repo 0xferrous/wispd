@@ -833,6 +833,7 @@ fn view(state: &WispdUi, window_id: iced::window::Id) -> Element<'_, Message> {
                             .size(button_font_size)
                             .color(btn_fg),
                     )
+                    .padding([2, 8])
                     .style(move |_, status| {
                         style_button(
                             status,
