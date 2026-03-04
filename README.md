@@ -248,6 +248,13 @@ Example:
 The module creates a `systemd --user` service (`wispd.service`) and sets a runtime
 `LD_LIBRARY_PATH`/`PATH` for Wayland and libxkbcommon dependencies.
 
+It also provides a D-Bus activation service (`org.freedesktop.Notifications`) via `dbus.packages`
+and wires `wispd.service` as a D-Bus service (`BusName=org.freedesktop.Notifications`).
+
+Useful module options:
+- `services.wispd.autostart = true|false` (default: `true`)
+- `services.wispd.dbusActivation.enable = true|false` (default: `true`)
+
 ## Niri + wispd MicroVM (QEMU)
 
 A ready-to-run MicroVM configuration is included via `github:microvm-nix/microvm.nix`.

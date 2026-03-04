@@ -34,17 +34,18 @@ bins/
 
 ## 3) Current runtime flow
 
-1. `wisp-debug` or `wispd` calls `WispSource::start_dbus(config)`.
-2. `wisp-source` connects to session bus, requests name `org.freedesktop.Notifications`, and serves interface at `/org/freedesktop/Notifications`.
-3. Client apps call `Notify`.
-4. `wisp-source` converts D-Bus args into `wisp_types::Notification`.
-5. Notification is inserted/replaced in in-memory store.
-6. `wisp-source` schedules timeout expiry (if applicable).
-7. `wisp-source` emits `NotificationEvent` through `tokio::mpsc`.
-8. `wispd` runs `wisp-source` on a dedicated Tokio runtime thread and forwards events to the UI via a std channel.
-9. `wispd` applies queue policy (max visible, newest on top, replacement in-place).
-10. `wispd` opens one layer-shell window per visible notification and reflows their margins for stacking.
-11. For timed notifications, `wispd` renders a progress edge bar (top/bottom) using elapsed time vs effective timeout.
+1. `wisp-debug` or `wispd` starts the daemon process (manually, systemd autostart, or D-Bus activation via `org.freedesktop.Notifications.service`).
+2. `wispd` calls `WispSource::start_dbus(config)`.
+3. `wisp-source` connects to session bus, requests name `org.freedesktop.Notifications`, and serves interface at `/org/freedesktop/Notifications`.
+4. Client apps call `Notify`.
+5. `wisp-source` converts D-Bus args into `wisp_types::Notification`.
+6. Notification is inserted/replaced in in-memory store.
+7. `wisp-source` schedules timeout expiry (if applicable).
+8. `wisp-source` emits `NotificationEvent` through `tokio::mpsc`.
+9. `wispd` runs `wisp-source` on a dedicated Tokio runtime thread and forwards events to the UI via a std channel.
+10. `wispd` applies queue policy (max visible, newest on top, replacement in-place).
+11. `wispd` opens one layer-shell window per visible notification and reflows their margins for stacking.
+12. For timed notifications, `wispd` renders a progress edge bar (top/bottom) using elapsed time vs effective timeout.
 
 ## 4) `wisp-source` responsibilities
 

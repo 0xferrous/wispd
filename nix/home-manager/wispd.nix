@@ -7,6 +7,12 @@ let
     pkgs.wayland
     pkgs.libxkbcommon
   ];
+  dbusActivationServicePackage = pkgs.writeTextDir "share/dbus-1/services/org.freedesktop.Notifications.service" ''
+    [D-BUS Service]
+    Name=org.freedesktop.Notifications
+    SystemdService=wispd.service
+    Exec=${cfg.package}/bin/wispd
+  '';
 in
 {
   options.services.wispd = {
@@ -31,6 +37,20 @@ in
       default = { };
       description = "Extra environment variables passed to the wispd user service.";
     };
+
+    autostart = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Whether to start wispd with graphical-session.target in addition to D-Bus activation.";
+    };
+
+    dbusActivation = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to include a D-Bus service definition for org.freedesktop.Notifications activation.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -46,6 +66,8 @@ in
       }
     ];
 
+    dbus.packages = lib.optional cfg.dbusActivation.enable dbusActivationServicePackage;
+
     systemd.user.services.wispd = {
       Unit = {
         Description = "wispd notification daemon";
@@ -55,6 +77,8 @@ in
       };
 
       Service = {
+        Type = "dbus";
+        BusName = "org.freedesktop.Notifications";
         ExecStart = "${cfg.package}/bin/wispd";
         Restart = "on-failure";
         RestartSec = 1;
@@ -67,7 +91,7 @@ in
           ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.extraEnvironment;
       };
 
-      Install = {
+      Install = lib.mkIf cfg.autostart {
         WantedBy = [ "graphical-session.target" ];
       };
     };
