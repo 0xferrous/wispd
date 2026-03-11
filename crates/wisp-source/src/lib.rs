@@ -719,6 +719,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_replaces_id_allocates_fresh_id() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let first_id = source.notify(test_notification("first"), 0).await.unwrap();
+        let _ = rx.recv().await;
+
+        let second_id = source
+            .notify(test_notification("second"), 999_999)
+            .await
+            .unwrap();
+        assert_ne!(first_id, second_id);
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Received { id, notification } => {
+                assert_eq!(id, second_id);
+                assert_eq!(notification.summary, "second");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn timeout_emits_closed_expired_event() {
         let cfg = SourceConfig {
             default_timeout_ms: Some(20),
@@ -745,6 +767,117 @@ mod tests {
             .unwrap()
             .unwrap();
         match second {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::Expired);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_timeout_without_default_is_persistent() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source
+            .notify(test_notification("persistent"), 0)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Received { id: event_id, .. } => assert_eq!(event_id, id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(maybe_event.is_err(), "unexpected timeout event was emitted");
+
+        let snapshot = source.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, id);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_never_schedules_expiry() {
+        let (source, mut rx) = WispSource::new(SourceConfig {
+            default_timeout_ms: Some(10),
+            ..SourceConfig::default()
+        });
+
+        let id = source
+            .notify(
+                Notification {
+                    timeout_ms: 0,
+                    ..test_notification("persistent-zero")
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Received { id: event_id, .. } => assert_eq!(event_id, id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(maybe_event.is_err(), "unexpected timeout event was emitted");
+
+        let snapshot = source.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, id);
+    }
+
+    #[tokio::test]
+    async fn replacement_resets_timeout_generation() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source
+            .notify(
+                Notification {
+                    timeout_ms: 20,
+                    ..test_notification("first")
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let replaced_id = source
+            .notify(
+                Notification {
+                    timeout_ms: 80,
+                    ..test_notification("second")
+                },
+                id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced_id, id);
+
+        let replaced = rx.recv().await.unwrap();
+        match replaced {
+            NotificationEvent::Replaced { id: event_id, .. } => assert_eq!(event_id, id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(30), rx.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "replacement should have canceled the old timeout generation"
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match closed {
             NotificationEvent::Closed {
                 id: event_id,
                 reason,
@@ -817,6 +950,82 @@ mod tests {
 
         let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
         assert!(maybe_event.is_err(), "unexpected event was emitted");
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_replace_and_close_state() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source.notify(test_notification("first"), 0).await.unwrap();
+        let _ = rx.recv().await;
+
+        source
+            .notify(test_notification("second"), id)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let snapshot = source.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, id);
+        assert_eq!(snapshot[0].1.summary, "second");
+
+        let closed = source.close(id, CloseReason::ClosedByCall).await.unwrap();
+        assert!(closed);
+        let _ = rx.recv().await;
+
+        assert!(source.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_unknown_id_is_safe_noop() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let closed = source.close(42, CloseReason::ClosedByCall).await.unwrap();
+        assert!(!closed);
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(maybe_event.is_err(), "unexpected event was emitted");
+    }
+
+    #[test]
+    fn parse_hints_extracts_known_fields_exactly() {
+        let mut raw_hints: HashMap<String, zvariant::OwnedValue> = HashMap::new();
+        raw_hints.insert("urgency".to_string(), 0_u8.into());
+        raw_hints.insert(
+            "category".to_string(),
+            zvariant::OwnedValue::from(zvariant::Str::from("email.arrived")),
+        );
+        raw_hints.insert(
+            "desktop-entry".to_string(),
+            zvariant::OwnedValue::from(zvariant::Str::from("org.example.Mail")),
+        );
+        raw_hints.insert("transient".to_string(), zvariant::OwnedValue::from(true));
+
+        let (urgency, hints) = parse_hints(&raw_hints);
+
+        assert_eq!(urgency, Urgency::Low);
+        assert_eq!(hints.category.as_deref(), Some("email.arrived"));
+        assert_eq!(hints.desktop_entry.as_deref(), Some("org.example.Mail"));
+        assert_eq!(hints.transient, Some(true));
+        assert!(hints.extra.is_empty());
+    }
+
+    #[test]
+    fn parse_actions_handles_empty_and_odd_action_lists_safely() {
+        assert!(parse_actions(Vec::new()).is_empty());
+
+        let parsed = parse_actions(vec!["only-key".to_string()]);
+        assert!(parsed.is_empty());
+
+        let parsed = parse_actions(vec![
+            "open".to_string(),
+            "Open".to_string(),
+            "dangling".to_string(),
+        ]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].key, "open");
+        assert_eq!(parsed[0].label, "Open");
     }
 
     async fn setup_dbus_source_for_test(
@@ -1140,5 +1349,438 @@ mod tests {
                 cfg.spec_version,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn dbus_capabilities_and_server_info_stay_correct_after_runtime_reload() {
+        let Some((cfg, source, _rx, _service, client)) =
+            setup_dbus_source_for_test("ReloadInfo").await
+        else {
+            return;
+        };
+
+        source.update_runtime_config(vec!["body".to_string(), "actions".to_string()], Some(50));
+
+        let caps_msg = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "GetCapabilities",
+                &(),
+            )
+            .await
+            .unwrap();
+        let capabilities: Vec<String> = caps_msg.body().deserialize().unwrap();
+        assert_eq!(
+            capabilities,
+            vec!["body".to_string(), "actions".to_string()]
+        );
+
+        let info_msg = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "GetServerInformation",
+                &(),
+            )
+            .await
+            .unwrap();
+        let info: (String, String, String, String) = info_msg.body().deserialize().unwrap();
+        assert_eq!(
+            info,
+            (
+                cfg.server_name,
+                cfg.server_vendor,
+                cfg.server_version,
+                cfg.spec_version,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_update_changes_capabilities_and_default_timeout() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        source.update_runtime_config(vec!["body".to_string(), "actions".to_string()], Some(25));
+        assert_eq!(
+            source.capabilities(),
+            vec!["body".to_string(), "actions".to_string()]
+        );
+
+        let id = source
+            .notify(test_notification("reload-timeout"), 0)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Received { id: event_id, .. } => assert_eq!(event_id, id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::Expired);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_config_update_does_not_duplicate_or_drop_active_timers() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source
+            .notify(
+                Notification {
+                    timeout_ms: 40,
+                    ..test_notification("active-timer")
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Received { id: event_id, .. } => assert_eq!(event_id, id),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        source.update_runtime_config(vec!["body".to_string(), "actions".to_string()], Some(5));
+
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::Expired);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "unexpected extra timeout event was emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn dbus_notify_burst_preserves_order_and_ids() {
+        let Some((cfg, _source, mut rx, _service, client)) =
+            setup_dbus_source_for_test("Burst").await
+        else {
+            return;
+        };
+
+        let mut ids = Vec::new();
+        for summary in ["one", "two", "three"] {
+            let msg = client
+                .call_method(
+                    Some(cfg.dbus_name.as_str()),
+                    cfg.dbus_path.as_str(),
+                    Some(DBUS_INTERFACE),
+                    "Notify",
+                    &(
+                        String::from("test-client"),
+                        0_u32,
+                        String::new(),
+                        String::from(summary),
+                        String::new(),
+                        Vec::<String>::new(),
+                        HashMap::<String, zvariant::OwnedValue>::new(),
+                        10_000_i32,
+                    ),
+                )
+                .await
+                .unwrap();
+            ids.push(msg.body().deserialize::<u32>().unwrap());
+        }
+
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0] < ids[1] && ids[1] < ids[2]);
+
+        for (expected_id, expected_summary) in ids.into_iter().zip(["one", "two", "three"]) {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                NotificationEvent::Received { id, notification } => {
+                    assert_eq!(id, expected_id);
+                    assert_eq!(notification.summary, expected_summary);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dbus_replace_storm_leaves_single_final_live_notification() {
+        let Some((cfg, source, mut rx, _service, client)) =
+            setup_dbus_source_for_test("ReplaceStorm").await
+        else {
+            return;
+        };
+
+        let first = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "Notify",
+                &(
+                    String::from("test-client"),
+                    0_u32,
+                    String::new(),
+                    String::from("first"),
+                    String::new(),
+                    Vec::<String>::new(),
+                    HashMap::<String, zvariant::OwnedValue>::new(),
+                    10_000_i32,
+                ),
+            )
+            .await
+            .unwrap();
+        let id: u32 = first.body().deserialize().unwrap();
+        let _ = rx.recv().await;
+
+        for summary in ["second", "third", "final"] {
+            let msg = client
+                .call_method(
+                    Some(cfg.dbus_name.as_str()),
+                    cfg.dbus_path.as_str(),
+                    Some(DBUS_INTERFACE),
+                    "Notify",
+                    &(
+                        String::from("test-client"),
+                        id,
+                        String::new(),
+                        String::from(summary),
+                        String::new(),
+                        Vec::<String>::new(),
+                        HashMap::<String, zvariant::OwnedValue>::new(),
+                        10_000_i32,
+                    ),
+                )
+                .await
+                .unwrap();
+            let replaced_id: u32 = msg.body().deserialize().unwrap();
+            assert_eq!(replaced_id, id);
+            match rx.recv().await.unwrap() {
+                NotificationEvent::Replaced {
+                    id: event_id,
+                    current,
+                    ..
+                } => {
+                    assert_eq!(event_id, id);
+                    assert_eq!(current.summary, summary);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        let snapshot = source.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, id);
+        assert_eq!(snapshot[0].1.summary, "final");
+    }
+
+    #[tokio::test]
+    async fn close_notification_during_active_timeout_emits_single_final_close() {
+        let Some((cfg, _source, mut rx, _service, client)) =
+            setup_dbus_source_for_test("CloseVsTimeout").await
+        else {
+            return;
+        };
+
+        let proxy = make_notifications_proxy(&client, &cfg).await.unwrap();
+        let mut closed_stream = proxy.receive_signal("NotificationClosed").await.unwrap();
+
+        let notify_msg = client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "Notify",
+                &(
+                    String::from("test-client"),
+                    0_u32,
+                    String::new(),
+                    String::from("hello"),
+                    String::new(),
+                    Vec::<String>::new(),
+                    HashMap::<String, zvariant::OwnedValue>::new(),
+                    200_i32,
+                ),
+            )
+            .await
+            .unwrap();
+        let id: u32 = notify_msg.body().deserialize().unwrap();
+        let _ = rx.recv().await;
+
+        client
+            .call_method(
+                Some(cfg.dbus_name.as_str()),
+                cfg.dbus_path.as_str(),
+                Some(DBUS_INTERFACE),
+                "CloseNotification",
+                &(id),
+            )
+            .await
+            .unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::ClosedByCall);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let signal = tokio::time::timeout(Duration::from_secs(2), closed_stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let (signal_id, reason_code): (u32, u32) = signal.body().deserialize().unwrap();
+        assert_eq!(signal_id, id);
+        assert_eq!(reason_code, 3);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let maybe_event = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            maybe_event.is_err(),
+            "unexpected extra close event was emitted"
+        );
+
+        let maybe_signal =
+            tokio::time::timeout(Duration::from_millis(50), closed_stream.next()).await;
+        assert!(
+            maybe_signal.is_err(),
+            "unexpected extra close signal was emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoking_action_after_replacement_targets_current_generation() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source
+            .notify(test_notification_with_action("first", "open"), 0)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let replaced = Notification {
+            summary: "second".to_string(),
+            actions: vec![NotificationAction {
+                key: "reply".to_string(),
+                label: "Reply".to_string(),
+            }],
+            ..test_notification("second")
+        };
+        let replaced_id = source.notify(replaced, id).await.unwrap();
+        assert_eq!(replaced_id, id);
+        let _ = rx.recv().await;
+
+        let old_action_result = source.invoke_action(id, "open").await.unwrap();
+        assert!(!old_action_result);
+
+        let new_action_result = source.invoke_action(id, "reply").await.unwrap();
+        assert!(new_action_result);
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::ActionInvoked {
+                id: event_id,
+                action_key,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(action_key, "reply");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::Dismissed);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_action_keys_are_handled_safely() {
+        let (source, mut rx) = WispSource::new(SourceConfig::default());
+
+        let id = source
+            .notify(
+                Notification {
+                    actions: vec![
+                        NotificationAction {
+                            key: "open".to_string(),
+                            label: "Open primary".to_string(),
+                        },
+                        NotificationAction {
+                            key: "open".to_string(),
+                            label: "Open secondary".to_string(),
+                        },
+                    ],
+                    ..test_notification("dup-actions")
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let invoked = source.invoke_action(id, "open").await.unwrap();
+        assert!(invoked);
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::ActionInvoked {
+                id: event_id,
+                action_key,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(action_key, "open");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        match rx.recv().await.unwrap() {
+            NotificationEvent::Closed {
+                id: event_id,
+                reason,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(reason, CloseReason::Dismissed);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

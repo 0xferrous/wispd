@@ -145,6 +145,8 @@ Config file is loaded from:
 Runtime reload:
 - `wispd` listens for `SIGHUP`.
 - On `SIGHUP`, it reloads `config.toml` and applies updated UI settings in place.
+- Reload is applied only when config loading passes TOML parsing and basic sanity validation (for example valid anchors, timeout-progress position, colors, and non-zero popup size).
+- If reload validation fails, `wispd` keeps the current configuration and emits a local critical notification describing the reload failure.
 - Source runtime settings (`capabilities`, `default_timeout_ms`) are updated without restarting D-Bus ownership.
 
 ## 7) Testing status
@@ -152,16 +154,43 @@ Runtime reload:
 Implemented tests in `wisp-source`:
 
 - replacement keeps same ID
+- missing `replaces_id` allocates a fresh ID
+- replacement resets timeout generation (old expiry does not win)
 - timeout expiry emits `Closed(Expired)` event
+- negative timeout without configured default remains persistent
+- zero timeout remains persistent (no expiry scheduled)
 - action invoke emits `ActionInvoked` + `Closed(Dismissed)`
 - unknown action returns false and emits no extra events
+- invoking actions after replacement targets the current notification generation/actions
+- duplicate action keys and empty/odd action lists are handled safely
+- snapshot reflects replacement and close state
+- closing unknown IDs is a safe no-op
+- hint parsing unit coverage for known fields (`urgency`, `category`, `desktop-entry`, `transient`)
 - D-Bus integration tests (skip when session bus unavailable):
   - `Notify` emits received event (including parsed icon/hints)
+  - rapid `Notify` bursts preserve ordering and allocated IDs
+  - replace storms over D-Bus converge to one final live notification state
+  - `CloseNotification` during active timeout races results in one final close event/signal
   - `CloseNotification` emits closed event with `ClosedByCall`
   - `NotificationClosed` signal is emitted with expected reason code
   - `ActionInvoked` signal is emitted for action invocation
   - `GetCapabilities` returns configured capabilities
   - `GetServerInformation` returns configured values
+  - runtime config updates are reflected in `GetCapabilities` while server info remains stable
+
+Implemented tests in `wispd` UI logic:
+
+- newest notification goes to front
+- replacement keeps its visible slot
+- replacing a hidden-but-still-visible notification does not corrupt visible ordering
+- closing/removal compacts visible UI state correctly
+- stack output policy resets when the last notification/window goes away
+- later notifications retain the current stack output binding while the stack is visible
+- output removal rebuilds visible windows only when the active stack binding is affected
+- config application updates UI settings and source runtime settings
+- applying config while notifications are visible preserves sane popup ordering
+- applying config does not strand windows on stale output bindings
+- placeholder formatting, icon-path helpers, timeout normalization, and click action routing have unit coverage
 
 ## 8) How to run debug daemon
 

@@ -592,6 +592,7 @@ struct WispdUi {
     stack_output_policy: Option<StackOutputPolicy>,
     ui: UiSection,
     default_timeout_ms: Option<i32>,
+    next_local_notification_id: u32,
 }
 
 impl WispdUi {
@@ -613,6 +614,7 @@ impl WispdUi {
             stack_output_policy: None,
             ui,
             default_timeout_ms,
+            next_local_notification_id: u32::MAX,
         }
     }
 
@@ -1001,9 +1003,21 @@ impl WispdUi {
     }
 
     fn reload_config(&mut self) -> Task<Message> {
-        let cfg = load_config();
         info!("runtime config reload requested");
-        self.apply_config(cfg)
+        self.apply_loaded_config(load_config_checked())
+    }
+
+    fn apply_loaded_config(&mut self, result: Result<AppConfig>) -> Task<Message> {
+        match result {
+            Ok(cfg) => self.apply_config(cfg),
+            Err(err) => {
+                warn!(%err, "runtime config reload rejected");
+                self.emit_local_notification(
+                    "Config reload failed",
+                    format!("Keeping current configuration. {err}"),
+                )
+            }
+        }
     }
 
     fn apply_config(&mut self, cfg: AppConfig) -> Task<Message> {
@@ -1031,6 +1045,29 @@ impl WispdUi {
 
         tasks.push(self.relayout_task());
         Task::batch(tasks)
+    }
+
+    fn next_local_notification_id(&mut self) -> u32 {
+        let id = self.next_local_notification_id;
+        self.next_local_notification_id = self.next_local_notification_id.saturating_sub(1);
+        id
+    }
+
+    fn emit_local_notification(&mut self, summary: &str, body: String) -> Task<Message> {
+        let id = self.next_local_notification_id();
+        self.insert_new(
+            id,
+            Notification {
+                app_name: "wispd".to_string(),
+                app_icon: String::new(),
+                summary: summary.to_string(),
+                body,
+                urgency: Urgency::Critical,
+                timeout_ms: 5000,
+                actions: vec![],
+                hints: Default::default(),
+            },
+        )
     }
 }
 
@@ -1884,20 +1921,99 @@ fn config_path() -> PathBuf {
     base.join("wispd").join("config.toml")
 }
 
-fn load_config() -> AppConfig {
+fn validate_app_config(cfg: &AppConfig) -> Result<()> {
+    let valid_anchor = matches!(
+        cfg.ui.anchor.as_str(),
+        "top-left"
+            | "top-right"
+            | "bottom-left"
+            | "bottom-right"
+            | "top"
+            | "bottom"
+            | "left"
+            | "right"
+    );
+    if !valid_anchor {
+        return Err(anyhow!("invalid ui.anchor: {}", cfg.ui.anchor));
+    }
+
+    if !cfg.ui.timeout_progress_position.eq_ignore_ascii_case("top")
+        && !cfg
+            .ui
+            .timeout_progress_position
+            .eq_ignore_ascii_case("bottom")
+    {
+        return Err(anyhow!(
+            "invalid ui.timeout_progress_position: {}",
+            cfg.ui.timeout_progress_position
+        ));
+    }
+
+    for (name, color) in [
+        ("ui.colors.low", cfg.ui.colors.low.as_str()),
+        ("ui.colors.normal", cfg.ui.colors.normal.as_str()),
+        ("ui.colors.critical", cfg.ui.colors.critical.as_str()),
+        ("ui.colors.background", cfg.ui.colors.background.as_str()),
+        ("ui.colors.text", cfg.ui.colors.text.as_str()),
+        (
+            "ui.colors.timeout_progress",
+            cfg.ui.colors.timeout_progress.as_str(),
+        ),
+        (
+            "ui.text.app_name.color",
+            cfg.ui.text.app_name.color.as_str(),
+        ),
+        ("ui.text.summary.color", cfg.ui.text.summary.color.as_str()),
+        ("ui.text.body.color", cfg.ui.text.body.color.as_str()),
+        ("ui.buttons.text_color", cfg.ui.buttons.text_color.as_str()),
+        ("ui.buttons.background", cfg.ui.buttons.background.as_str()),
+        (
+            "ui.buttons.border_color",
+            cfg.ui.buttons.border_color.as_str(),
+        ),
+        (
+            "ui.buttons.hover_background",
+            cfg.ui.buttons.hover_background.as_str(),
+        ),
+        (
+            "ui.buttons.hover_text_color",
+            cfg.ui.buttons.hover_text_color.as_str(),
+        ),
+    ] {
+        if parse_hex_color(color).is_none() {
+            return Err(anyhow!("invalid color for {name}: {color}"));
+        }
+    }
+
+    if cfg.ui.width == 0 {
+        return Err(anyhow!("ui.width must be greater than zero"));
+    }
+    if cfg.ui.height == 0 {
+        return Err(anyhow!("ui.height must be greater than zero"));
+    }
+
+    Ok(())
+}
+
+fn load_config_checked() -> Result<AppConfig> {
     let path = config_path();
     let Ok(raw) = fs::read_to_string(&path) else {
         info!(path = %path.display(), "config not found, using defaults");
-        return AppConfig::default();
+        return Ok(AppConfig::default());
     };
 
-    match toml::from_str::<AppConfig>(&raw) {
-        Ok(cfg) => {
-            info!(path = %path.display(), "loaded config");
-            cfg
-        }
+    let cfg = toml::from_str::<AppConfig>(&raw)
+        .map_err(|err| anyhow!("failed to parse {}: {err}", path.display()))?;
+    validate_app_config(&cfg)?;
+    info!(path = %path.display(), "loaded config");
+    Ok(cfg)
+}
+
+fn load_config() -> AppConfig {
+    match load_config_checked() {
+        Ok(cfg) => cfg,
         Err(err) => {
-            warn!(path = %path.display(), %err, "failed to parse config, using defaults");
+            warn!(%err, "failed to load config, using defaults");
             AppConfig::default()
         }
     }
@@ -2204,6 +2320,21 @@ mod tests {
     }
 
     #[test]
+    fn closing_last_notification_resets_stack_output_policy() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::CompositorChosen);
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(NotificationEvent::Closed {
+            id: 1,
+            reason: CloseReason::ClosedByCall,
+        });
+
+        assert!(ui.windows.is_empty());
+        assert_eq!(ui.stack_output_policy, None);
+    }
+
+    #[test]
     fn format_string_substitutes_placeholders() {
         let n = UiNotification {
             id: 9,
@@ -2302,6 +2433,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_app_config_rejects_invalid_anchor() {
+        let mut cfg = AppConfig::default();
+        cfg.ui.anchor = "middle-right".to_string();
+        assert!(validate_app_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_app_config_rejects_invalid_color() {
+        let mut cfg = AppConfig::default();
+        cfg.ui.colors.background = "nope".to_string();
+        assert!(validate_app_config(&cfg).is_err());
+    }
+
+    #[test]
     fn output_option_parses_focused_with_empty_stack() {
         assert_eq!(
             output_option_from_config("focused", None),
@@ -2397,6 +2542,95 @@ mod tests {
     }
 
     #[test]
+    fn apply_config_with_visible_notifications_preserves_sane_popup_order() {
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(3, "three"));
+
+        let mut cfg = AppConfig::default();
+        cfg.source.capabilities = vec!["body".to_string()];
+        cfg.ui.max_visible = 2;
+
+        let _ = ui.apply_config(cfg);
+
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 3);
+        assert_eq!(ui.windows[1].notification_id, 2);
+        assert!(ui.notifications.contains_key(&2));
+        assert!(ui.notifications.contains_key(&3));
+        assert!(!ui.notifications.contains_key(&1));
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            SourceCommand::ReloadConfig {
+                capabilities: vec!["body".to_string()],
+                default_timeout_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_config_does_not_strand_windows_on_stale_outputs() {
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::Named("DP-1".to_string()));
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let old_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+
+        let mut cfg = AppConfig::default();
+        cfg.source.capabilities = vec!["body".to_string(), "actions".to_string()];
+        cfg.ui.output = "HDMI-A-1".to_string();
+
+        let _ = ui.apply_config(cfg);
+
+        let new_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+        assert_eq!(
+            ui.stack_output_policy,
+            Some(StackOutputPolicy::Named("DP-1".to_string()))
+        );
+        assert_eq!(new_window_ids, old_window_ids);
+        assert_eq!(
+            cmd_rx.try_recv().unwrap(),
+            SourceCommand::ReloadConfig {
+                capabilities: vec!["body".to_string(), "actions".to_string()],
+                default_timeout_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_reload_keeps_current_state_and_emits_local_notification() {
+        let (mut ui, mut cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::Named("DP-1".to_string()));
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let old_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+        let old_next_local = ui.next_local_notification_id;
+
+        let _ = ui.apply_loaded_config(Err(anyhow!("invalid ui.anchor: nope")));
+
+        assert_eq!(
+            ui.stack_output_policy,
+            Some(StackOutputPolicy::Named("DP-1".to_string()))
+        );
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[1].notification_id, 1);
+        assert_eq!(ui.windows[1].window_id, old_window_ids[0]);
+        assert!(
+            ui.notifications.values().any(
+                |n| n.summary == "Config reload failed" && n.body.contains("invalid ui.anchor")
+            )
+        );
+        assert!(ui.next_local_notification_id < old_next_local);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "invalid reload should not notify source thread"
+        );
+    }
+
+    #[test]
     fn right_click_can_dismiss() {
         let ui_cfg = UiSection {
             right_click_action: ClickAction::Dismiss,
@@ -2469,5 +2703,116 @@ mod tests {
 
         assert!(ui.notifications.is_empty());
         assert!(ui.windows.is_empty());
+    }
+
+    #[test]
+    fn closing_last_window_resets_stack_output_policy() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::Named("DP-1".to_string()));
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let window_id = ui.windows[0].window_id;
+
+        let _ = update(&mut ui, Message::WindowClosed(window_id));
+
+        assert!(ui.windows.is_empty());
+        assert_eq!(ui.stack_output_policy, None);
+    }
+
+    #[test]
+    fn max_visible_truncates_only_visible_popup_set() {
+        let ui_cfg = UiSection {
+            max_visible: 2,
+            ..UiSection::default()
+        };
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(ui_cfg);
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(3, "three"));
+
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 3);
+        assert_eq!(ui.windows[1].notification_id, 2);
+        assert_eq!(ui.notifications.len(), 2);
+        assert!(!ui.notifications.contains_key(&1));
+    }
+
+    #[test]
+    fn closing_middle_notification_compacts_visible_stack() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(3, "three"));
+        let _ = ui.apply_event(NotificationEvent::Closed {
+            id: 2,
+            reason: CloseReason::ClosedByCall,
+        });
+
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 3);
+        assert_eq!(ui.windows[1].notification_id, 1);
+        assert!(ui.notifications.contains_key(&1));
+        assert!(!ui.notifications.contains_key(&2));
+        assert!(ui.notifications.contains_key(&3));
+    }
+
+    #[test]
+    fn popup_order_remains_stable_across_burst() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        for (id, summary) in [(1, "one"), (2, "two"), (3, "three"), (4, "four")] {
+            let _ = ui.apply_event(sample(id, summary));
+        }
+
+        let visible: Vec<u32> = ui.windows.iter().map(|w| w.notification_id).collect();
+        assert_eq!(visible, vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn replacing_hidden_notification_does_not_corrupt_visible_ordering() {
+        let ui_cfg = UiSection {
+            max_visible: 2,
+            ..UiSection::default()
+        };
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(ui_cfg);
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(3, "three"));
+
+        let _ = ui.apply_event(NotificationEvent::Replaced {
+            id: 2,
+            previous: Box::new(Notification {
+                summary: String::from("two"),
+                ..Notification::default()
+            }),
+            current: Box::new(Notification {
+                summary: String::from("two-new"),
+                ..Notification::default()
+            }),
+        });
+
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 3);
+        assert_eq!(ui.windows[1].notification_id, 2);
+        assert_eq!(ui.notifications.get(&2).unwrap().summary, "two-new");
+    }
+
+    #[test]
+    fn later_notifications_stick_to_existing_stack_output_policy() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let initial_policy = ui.stack_output_policy.clone();
+        assert_eq!(initial_policy, Some(StackOutputPolicy::CompositorChosen));
+
+        let _ = ui.apply_event(sample(2, "two"));
+        let _ = ui.apply_event(sample(3, "three"));
+
+        assert_eq!(ui.stack_output_policy, initial_policy);
+        let visible: Vec<u32> = ui.windows.iter().map(|w| w.notification_id).collect();
+        assert_eq!(visible, vec![3, 2, 1]);
     }
 }
