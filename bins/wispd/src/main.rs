@@ -1,15 +1,20 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    future::Future,
+    hash::Hash,
+    mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook},
     path::PathBuf,
     process::Command,
     sync::{Arc, Mutex, mpsc},
+    task::Poll,
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
 use iced::advanced::widget as adv_widget;
+use iced::futures::{SinkExt, channel::mpsc::Sender};
 use iced::widget::button::Status as ButtonStatus;
 use iced::widget::{button, column, container, image, mouse_area, row, text};
 use iced::{
@@ -24,8 +29,296 @@ use iced_layershell::to_layer_message;
 use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{info, warn};
+use wayland_client::{
+    Connection, Dispatch, EventQueue, Proxy, delegate_noop,
+    globals::{BindError, GlobalError, GlobalListContents, registry_queue_init},
+    protocol::{
+        wl_output::{self, WlOutput},
+        wl_registry,
+    },
+};
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
+};
 use wisp_source::{SourceConfig, WispSource};
 use wisp_types::{Notification, NotificationAction, NotificationEvent, Urgency};
+
+#[derive(Debug)]
+struct BaseWaylandState;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for BaseWaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: <wl_registry::WlRegistry as Proxy>::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+    ) {
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputHotplugEvent {
+    Added { name: String, description: String },
+    Removed { name: Option<String> },
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct PendingOutputInfo {
+    registry_name: u32,
+    zxdg_output: ZxdgOutputV1,
+    name: String,
+    description: String,
+    is_ready: bool,
+}
+
+impl PendingOutputInfo {
+    fn new(registry_name: u32, zxdg_output: ZxdgOutputV1) -> Self {
+        Self {
+            registry_name,
+            zxdg_output,
+            name: String::new(),
+            description: String::new(),
+            is_ready: false,
+        }
+    }
+
+    fn refresh_ready(&mut self) {
+        self.is_ready = !self.name.is_empty() && !self.description.is_empty();
+    }
+}
+
+#[derive(Debug)]
+struct KnownOutputInfo {
+    registry_name: u32,
+    name: String,
+}
+
+#[derive(Debug)]
+struct OutputWatchState {
+    xdg_output_manager: ZxdgOutputManagerV1,
+    pending_outputs: Vec<PendingOutputInfo>,
+    known_outputs: Vec<KnownOutputInfo>,
+    events: Vec<OutputHotplugEvent>,
+}
+
+impl OutputWatchState {
+    fn new(xdg_output_manager: ZxdgOutputManagerV1) -> Self {
+        Self {
+            xdg_output_manager,
+            pending_outputs: Vec::new(),
+            known_outputs: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for OutputWatchState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_registry::WlRegistry,
+        event: <wl_registry::WlRegistry as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == wl_output::WlOutput::interface().name {
+                    let output = proxy.bind::<wl_output::WlOutput, _, _>(name, version, qh, ());
+                    let zxdg_output = state.xdg_output_manager.get_xdg_output(&output, qh, ());
+                    state
+                        .pending_outputs
+                        .push(PendingOutputInfo::new(name, zxdg_output));
+                }
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                if let Some(index) = state
+                    .known_outputs
+                    .iter()
+                    .position(|output| output.registry_name == name)
+                {
+                    let removed = state.known_outputs.remove(index);
+                    state.events.push(OutputHotplugEvent::Removed {
+                        name: Some(removed.name),
+                    });
+                } else if let Some(index) = state
+                    .pending_outputs
+                    .iter()
+                    .position(|output| output.registry_name == name)
+                {
+                    state.pending_outputs.remove(index);
+                    state
+                        .events
+                        .push(OutputHotplugEvent::Removed { name: None });
+                } else {
+                    state
+                        .events
+                        .push(OutputHotplugEvent::Removed { name: None });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for OutputWatchState {
+    fn event(
+        state: &mut Self,
+        zxdg_output: &zxdg_output_v1::ZxdgOutputV1,
+        event: <zxdg_output_v1::ZxdgOutputV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        let Some((index, pending)) = state
+            .pending_outputs
+            .iter_mut()
+            .enumerate()
+            .find(|(_, output)| output.zxdg_output == *zxdg_output)
+        else {
+            return;
+        };
+
+        match event {
+            zxdg_output_v1::Event::Name { name } => pending.name = name,
+            zxdg_output_v1::Event::Description { description } => {
+                pending.description = description;
+            }
+            _ => {}
+        }
+
+        pending.refresh_ready();
+        if pending.is_ready {
+            let ready = state.pending_outputs.remove(index);
+            state.known_outputs.push(KnownOutputInfo {
+                registry_name: ready.registry_name,
+                name: ready.name.clone(),
+            });
+            state.events.push(OutputHotplugEvent::Added {
+                name: ready.name,
+                description: ready.description,
+            });
+        }
+    }
+}
+
+delegate_noop!(OutputWatchState: ignore WlOutput);
+delegate_noop!(OutputWatchState: ignore ZxdgOutputManagerV1);
+
+#[derive(Debug, Clone)]
+struct HashedWaylandConnection {
+    connection: Connection,
+}
+
+impl From<Connection> for HashedWaylandConnection {
+    fn from(connection: Connection) -> Self {
+        Self { connection }
+    }
+}
+
+impl Hash for HashedWaylandConnection {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.connection.display().hash(state);
+    }
+}
+
+#[derive(Debug)]
+struct QueuePoll<'a, 'b> {
+    queue: ManuallyDrop<&'a mut EventQueue<OutputWatchState>>,
+    state: ManuallyDrop<&'b mut OutputWatchState>,
+}
+
+impl<'a, 'b> QueuePoll<'a, 'b> {
+    fn new(queue: &'a mut EventQueue<OutputWatchState>, state: &'b mut OutputWatchState) -> Self {
+        Self {
+            queue: ManuallyDrop::new(queue),
+            state: ManuallyDrop::new(state),
+        }
+    }
+}
+
+impl<'a, 'b> Future for QueuePoll<'a, 'b> {
+    type Output = std::result::Result<OutputHotplugEvent, anyhow::Error>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let mut poll_state = self.as_mut();
+        let state = unsafe { ManuallyDrop::take(&mut poll_state.state) };
+        let queue = unsafe { ManuallyDrop::take(&mut poll_state.queue) };
+
+        if state.events.is_empty() {
+            if let Err(err) = queue.roundtrip(state) {
+                return Poll::Ready(Err(anyhow!(err)));
+            }
+
+            poll_state.queue = ManuallyDrop::new(queue);
+            poll_state.state = ManuallyDrop::new(state);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            let event = state.events.remove(0);
+            poll_state.queue = ManuallyDrop::new(queue);
+            poll_state.state = ManuallyDrop::new(state);
+            Poll::Ready(Ok(event))
+        }
+    }
+}
+
+async fn next_output_hotplug_event(
+    event_queue: &mut EventQueue<OutputWatchState>,
+    state: &mut OutputWatchState,
+) -> std::result::Result<OutputHotplugEvent, anyhow::Error> {
+    QueuePoll::new(event_queue, state).await
+}
+
+async fn output_hotplug_subscription(
+    output: &mut Sender<OutputHotplugEvent>,
+    connection: HashedWaylandConnection,
+) -> std::result::Result<(), anyhow::Error> {
+    let connection = connection.connection.clone();
+    let (globals, _) = registry_queue_init::<BaseWaylandState>(&connection)
+        .map_err(|err: GlobalError| anyhow!(err))?;
+
+    let mut event_queue = connection.new_event_queue::<OutputWatchState>();
+    let qhandle = event_queue.handle();
+    let display = connection.display();
+    let xdg_output_manager = globals
+        .bind::<ZxdgOutputManagerV1, _, _>(&qhandle, 1..=3, ())
+        .map_err(|err: BindError| anyhow!(err))?;
+    let mut state = OutputWatchState::new(xdg_output_manager);
+
+    display.get_registry(&qhandle, ());
+
+    loop {
+        let event = next_output_hotplug_event(&mut event_queue, &mut state).await?;
+        output.send(event).await.ok();
+    }
+}
+
+fn listen_output_hotplug(connection: Connection) -> Subscription<OutputHotplugEvent> {
+    let connection: HashedWaylandConnection = connection.into();
+    Subscription::run_with(connection, |conn| {
+        let conn = conn.clone();
+        iced::stream::channel(100, |mut output| async move {
+            if let Err(err) = output_hotplug_subscription(&mut output, conn).await {
+                output
+                    .send(OutputHotplugEvent::Failed(err.to_string()))
+                    .await
+                    .ok();
+            }
+        })
+    })
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -258,6 +551,21 @@ struct WindowBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum StackOutputPolicy {
+    CompositorChosen,
+    Named(String),
+}
+
+impl StackOutputPolicy {
+    fn log_label(&self) -> String {
+        match self {
+            Self::CompositorChosen => "compositor-chosen".to_string(),
+            Self::Named(name) => format!("named:{name}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceCommand {
     InvokeAction {
         id: u32,
@@ -281,6 +589,7 @@ struct WispdUi {
     windows: VecDeque<WindowBinding>,
     measured_heights: HashMap<u32, u32>,
     pending_measure: HashSet<u32>,
+    stack_output_policy: Option<StackOutputPolicy>,
     ui: UiSection,
     default_timeout_ms: Option<i32>,
 }
@@ -301,6 +610,7 @@ impl WispdUi {
             windows: VecDeque::new(),
             measured_heights: HashMap::new(),
             pending_measure: HashSet::new(),
+            stack_output_policy: None,
             ui,
             default_timeout_ms,
         }
@@ -375,6 +685,9 @@ impl WispdUi {
     }
 
     fn insert_new(&mut self, id: u32, notification: Notification) -> Task<Message> {
+        let summary = notification.summary.clone();
+        let app_name = notification.app_name.clone();
+
         self.notifications.insert(
             id,
             to_ui_notification(id, notification, self.default_timeout_ms),
@@ -386,18 +699,38 @@ impl WispdUi {
             return Task::none();
         }
 
-        let mut tasks = Vec::new();
+        let stack_was_empty = self.windows.is_empty();
+        info!(id, app = %app_name, summary = %summary, stack_was_empty, visible = self.windows.len(), "opening notification popup");
+
+        let mut tasks = vec![self.open_window_for_notification(id)];
+
+        while self.windows.len() > self.ui.max_visible {
+            if let Some(evicted) = self.windows.pop_back() {
+                self.notifications.remove(&evicted.notification_id);
+                tasks.push(Task::done(Message::RemoveWindow(evicted.window_id)));
+            }
+        }
+
+        tasks.push(self.relayout_task());
+        Task::batch(tasks)
+    }
+
+    fn open_window_for_notification(&mut self, id: u32) -> Task<Message> {
         let popup_height = self.popup_height_for_id(id);
+        let had_existing_windows = !self.windows.is_empty();
+        let output_option = self.output_option_for_new_window();
+        let stack_policy = self
+            .stack_output_policy
+            .as_ref()
+            .map(StackOutputPolicy::log_label)
+            .unwrap_or_else(|| "none".to_string());
+        let output_target = describe_output_option(&output_option);
 
         let (window_id, open_task) = Message::layershell_open(NewLayerShellSettings {
             size: Some((self.ui.width.max(1), popup_height.max(1))),
             layer: Layer::Top,
             anchor: layer_anchor_from_str(&self.ui.anchor),
-            output_option: output_option_from_config(
-                &self.ui.output,
-                self.ui.focused_output_command.as_deref(),
-                !self.windows.is_empty(),
-            ),
+            output_option,
             keyboard_interactivity: KeyboardInteractivity::None,
             exclusive_zone: Some(0),
             margin: Some((
@@ -412,17 +745,46 @@ impl WispdUi {
             window_id,
             notification_id: id,
         });
-        tasks.push(open_task);
 
-        while self.windows.len() > self.ui.max_visible {
-            if let Some(evicted) = self.windows.pop_back() {
-                self.notifications.remove(&evicted.notification_id);
-                tasks.push(Task::done(Message::RemoveWindow(evicted.window_id)));
-            }
+        info!(
+            id,
+            ?window_id,
+            had_existing_windows,
+            output_target = %output_target,
+            stack_policy = %stack_policy,
+            visible = self.windows.len(),
+            "notification popup window opened"
+        );
+
+        open_task
+    }
+
+    fn output_option_for_new_window(&mut self) -> OutputOption {
+        if let Some(policy) = self.stack_output_policy.as_ref() {
+            let output_option = match policy {
+                StackOutputPolicy::CompositorChosen => OutputOption::LastOutput,
+                StackOutputPolicy::Named(name) => OutputOption::OutputName(name.clone()),
+            };
+            info!(
+                stack_policy = %policy.log_label(),
+                output_target = %describe_output_option(&output_option),
+                visible = self.windows.len(),
+                "reusing existing notification stack output binding"
+            );
+            return output_option;
         }
 
-        tasks.push(self.relayout_task());
-        Task::batch(tasks)
+        let (output_option, stack_policy) =
+            output_option_from_config(&self.ui.output, self.ui.focused_output_command.as_deref());
+        self.stack_output_policy = stack_policy;
+        info!(
+            configured_output = %self.ui.output,
+            stack_policy = %self.stack_output_policy.as_ref().map(StackOutputPolicy::log_label).unwrap_or_else(|| "none".to_string()),
+            output_target = %describe_output_option(&output_option),
+            visible = self.windows.len(),
+            "notification stack created"
+        );
+        output_option
     }
 
     fn remove_notification(&mut self, id: u32) -> Task<Message> {
@@ -433,13 +795,139 @@ impl WispdUi {
         if let Some(index) = self.windows.iter().position(|w| w.notification_id == id)
             && let Some(binding) = self.windows.remove(index)
         {
-            return Task::batch([
+            let mut tasks = vec![
                 Task::done(Message::RemoveWindow(binding.window_id)),
                 self.relayout_task(),
-            ]);
+            ];
+            if self.windows.is_empty() {
+                let previous_policy = self
+                    .stack_output_policy
+                    .as_ref()
+                    .map(StackOutputPolicy::log_label)
+                    .unwrap_or_else(|| "none".to_string());
+                self.stack_output_policy = None;
+                info!(id, previous_policy = %previous_policy, "notification stack destroyed after notification removal");
+                tasks.push(Task::done(Message::ForgetLastOutput));
+            }
+            return Task::batch(tasks);
         }
 
         Task::none()
+    }
+
+    fn handle_window_closed(&mut self, window_id: IcedId) -> Task<Message> {
+        let Some(index) = self.windows.iter().position(|w| w.window_id == window_id) else {
+            return Task::none();
+        };
+
+        let Some(binding) = self.windows.remove(index) else {
+            return Task::none();
+        };
+
+        self.notifications.remove(&binding.notification_id);
+        self.measured_heights.remove(&binding.notification_id);
+        self.pending_measure.remove(&binding.notification_id);
+
+        let mut tasks = vec![self.relayout_task()];
+        if self.windows.is_empty() {
+            let previous_policy = self
+                .stack_output_policy
+                .as_ref()
+                .map(StackOutputPolicy::log_label)
+                .unwrap_or_else(|| "none".to_string());
+            self.stack_output_policy = None;
+            info!(?window_id, previous_policy = %previous_policy, "notification stack destroyed after compositor closed last popup window");
+            tasks.push(Task::done(Message::ForgetLastOutput));
+        }
+        Task::batch(tasks)
+    }
+
+    fn rebuild_visible_windows(&mut self) -> Task<Message> {
+        let notification_ids: Vec<u32> = self.windows.iter().map(|w| w.notification_id).collect();
+        let window_ids: Vec<IcedId> = self.windows.iter().map(|w| w.window_id).collect();
+
+        let previous_policy = self
+            .stack_output_policy
+            .as_ref()
+            .map(StackOutputPolicy::log_label)
+            .unwrap_or_else(|| "none".to_string());
+
+        self.windows.clear();
+        self.stack_output_policy = None;
+
+        info!(
+            notification_count = notification_ids.len(),
+            window_count = window_ids.len(),
+            previous_policy = %previous_policy,
+            "rebuilding visible notification stack"
+        );
+
+        let mut tasks: Vec<Task<Message>> = window_ids
+            .into_iter()
+            .map(|window_id| Task::done(Message::RemoveWindow(window_id)))
+            .collect();
+        tasks.push(Task::done(Message::ForgetLastOutput));
+
+        for id in notification_ids.into_iter().rev() {
+            if self.notifications.contains_key(&id) {
+                tasks.push(self.open_window_for_notification(id));
+            }
+        }
+
+        tasks.push(self.relayout_task());
+        Task::batch(tasks)
+    }
+
+    fn handle_output_hotplug(&mut self, event: OutputHotplugEvent) -> Task<Message> {
+        match event {
+            OutputHotplugEvent::Added { name, description } => {
+                info!(
+                    output = %name,
+                    description = %description,
+                    visible = self.windows.len(),
+                    stack_policy = %self.stack_output_policy.as_ref().map(StackOutputPolicy::log_label).unwrap_or_else(|| "none".to_string()),
+                    "wayland output added"
+                );
+                Task::none()
+            }
+            OutputHotplugEvent::Removed { name } => {
+                let should_rebuild = match (&self.stack_output_policy, name.as_deref()) {
+                    (None, _) => false,
+                    (Some(StackOutputPolicy::CompositorChosen), _) => !self.windows.is_empty(),
+                    (Some(StackOutputPolicy::Named(current)), Some(removed)) => {
+                        !self.windows.is_empty() && current == removed
+                    }
+                    (Some(StackOutputPolicy::Named(_)), None) => !self.windows.is_empty(),
+                };
+
+                if let Some(name) = name.as_deref() {
+                    info!(
+                        output = %name,
+                        should_rebuild,
+                        visible = self.windows.len(),
+                        stack_policy = %self.stack_output_policy.as_ref().map(StackOutputPolicy::log_label).unwrap_or_else(|| "none".to_string()),
+                        "wayland output removed"
+                    );
+                } else {
+                    info!(
+                        should_rebuild,
+                        visible = self.windows.len(),
+                        stack_policy = %self.stack_output_policy.as_ref().map(StackOutputPolicy::log_label).unwrap_or_else(|| "none".to_string()),
+                        "wayland output removed"
+                    );
+                }
+
+                if should_rebuild {
+                    self.rebuild_visible_windows()
+                } else {
+                    Task::none()
+                }
+            }
+            OutputHotplugEvent::Failed(err) => {
+                warn!(%err, "wayland output hotplug subscription failed");
+                Task::none()
+            }
+        }
     }
 
     fn relayout_task(&self) -> Task<Message> {
@@ -554,19 +1042,27 @@ enum Message {
     NotificationLeftClick { id: u32 },
     NotificationRightClick { id: u32 },
     MeasuredPopupHeight { id: u32, height: Option<u32> },
+    WindowClosed(IcedId),
+    OutputHotplug(OutputHotplugEvent),
 }
 
 fn namespace() -> String {
     String::from("wispd")
 }
 
-fn subscription(_: &WispdUi) -> Subscription<Message> {
-    iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick)
+fn subscription(_: &WispdUi, wayland_connection: Connection) -> Subscription<Message> {
+    Subscription::batch([
+        iced::time::every(Duration::from_millis(33)).map(|_| Message::Tick),
+        iced::window::close_events().map(Message::WindowClosed),
+        listen_output_hotplug(wayland_connection).map(Message::OutputHotplug),
+    ])
 }
 
 fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
     match message {
         Message::Tick => state.on_tick(),
+        Message::WindowClosed(id) => state.handle_window_closed(id),
+        Message::OutputHotplug(event) => state.handle_output_hotplug(event),
         Message::ActionClicked { id, key } => {
             if let Err(err) = state.cmd_tx.send(SourceCommand::InvokeAction { id, key }) {
                 warn!(?err, "failed to send action command to source thread");
@@ -1284,28 +1780,41 @@ fn layer_anchor_from_str(anchor: &str) -> Anchor {
 fn output_option_from_config(
     output: &str,
     focused_output_command: Option<&str>,
-    has_existing_windows: bool,
-) -> OutputOption {
+) -> (OutputOption, Option<StackOutputPolicy>) {
     let trimmed = output.trim();
     let lower = trimmed.to_ascii_lowercase();
 
     match lower.as_str() {
         // Mako-like behavior:
         // - with an empty stack, let compositor pick (usually focused/current output)
-        // - with existing stack windows, keep using the last output so all popups stay together
+        // - once the first popup lands, keep the rest of the stack on that same output
         "focused" => resolve_focused_output_name(focused_output_command)
-            .map(OutputOption::OutputName)
-            .unwrap_or_else(|| {
-                if has_existing_windows {
-                    OutputOption::LastOutput
-                } else {
-                    OutputOption::None
-                }
-            }),
-        "last-output" | "last_output" => OutputOption::LastOutput,
-        "any" | "none" | "default" => OutputOption::None,
-        _ if trimmed.is_empty() => OutputOption::None,
-        _ => OutputOption::OutputName(trimmed.to_string()),
+            .map(|name| {
+                (
+                    OutputOption::OutputName(name.clone()),
+                    Some(StackOutputPolicy::Named(name)),
+                )
+            })
+            .unwrap_or((
+                OutputOption::CompositorDefault,
+                Some(StackOutputPolicy::CompositorChosen),
+            )),
+        "last-output" | "last_output" => (
+            OutputOption::LastOutput,
+            Some(StackOutputPolicy::CompositorChosen),
+        ),
+        "any" | "none" | "default" => (
+            OutputOption::CompositorDefault,
+            Some(StackOutputPolicy::CompositorChosen),
+        ),
+        _ if trimmed.is_empty() => (
+            OutputOption::CompositorDefault,
+            Some(StackOutputPolicy::CompositorChosen),
+        ),
+        _ => (
+            OutputOption::OutputName(trimmed.to_string()),
+            Some(StackOutputPolicy::Named(trimmed.to_string())),
+        ),
     }
 }
 
@@ -1315,18 +1824,33 @@ fn resolve_focused_output_name(focused_output_command: Option<&str>) -> Option<S
         return None;
     }
 
+    info!(command = %cmd, "resolving focused output via command");
+
     let out = Command::new("sh").arg("-c").arg(cmd).output().ok()?;
     if !out.status.success() {
+        warn!(command = %cmd, status = ?out.status.code(), "focused output command failed");
         return None;
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let name = stdout.lines().next()?.trim();
     if name.is_empty() {
+        warn!(command = %cmd, "focused output command produced empty output");
         return None;
     }
 
+    info!(command = %cmd, output = %name, "resolved focused output via command");
     Some(name.to_string())
+}
+
+fn describe_output_option(output_option: &OutputOption) -> String {
+    match output_option {
+        OutputOption::LastOutput => "last-output".to_string(),
+        OutputOption::OutputName(name) => format!("output-name:{name}"),
+        OutputOption::Output(_) => "output-object".to_string(),
+        OutputOption::CompositorDefault => "compositor-default".to_string(),
+        OutputOption::None => "library-default".to_string(),
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -1523,6 +2047,9 @@ fn main() -> Result<()> {
     let ui_default_timeout_ms = app_cfg.source.default_timeout_ms;
     let boot_cmd_tx = cmd_tx.clone();
 
+    let wayland_connection = Connection::connect_to_env()
+        .map_err(|err| anyhow!("failed to connect to wayland: {err}"))?;
+
     let settings = Settings {
         layer_settings: LayerShellSettings {
             // Bootstrap surface kept minimal; real notification windows are opened dynamically.
@@ -1534,8 +2061,11 @@ fn main() -> Result<()> {
             keyboard_interactivity: KeyboardInteractivity::None,
             ..Default::default()
         },
+        with_connection: Some(wayland_connection.clone()),
         ..Default::default()
     };
+
+    let subscription_connection = wayland_connection.clone();
 
     let app = daemon(
         move || {
@@ -1552,7 +2082,7 @@ fn main() -> Result<()> {
         view,
     )
     .style(app_style)
-    .subscription(subscription)
+    .subscription(move |state| subscription(state, subscription_connection.clone()))
     .settings(settings);
 
     let default_hook = take_hook();
@@ -1758,40 +2288,44 @@ mod tests {
     #[test]
     fn output_option_parses_focused_with_empty_stack() {
         assert_eq!(
-            output_option_from_config("focused", None, false),
-            OutputOption::None
-        );
-    }
-
-    #[test]
-    fn output_option_parses_focused_with_existing_stack() {
-        assert_eq!(
-            output_option_from_config("focused", None, true),
-            OutputOption::LastOutput
+            output_option_from_config("focused", None),
+            (
+                OutputOption::CompositorDefault,
+                Some(StackOutputPolicy::CompositorChosen)
+            )
         );
     }
 
     #[test]
     fn output_option_parses_last_output() {
         assert_eq!(
-            output_option_from_config("last-output", None, false),
-            OutputOption::LastOutput
+            output_option_from_config("last-output", None),
+            (
+                OutputOption::LastOutput,
+                Some(StackOutputPolicy::CompositorChosen)
+            )
         );
     }
 
     #[test]
     fn output_option_parses_output_name() {
         assert_eq!(
-            output_option_from_config("DP-1", None, false),
-            OutputOption::OutputName("DP-1".to_string())
+            output_option_from_config("DP-1", None),
+            (
+                OutputOption::OutputName("DP-1".to_string()),
+                Some(StackOutputPolicy::Named("DP-1".to_string()))
+            )
         );
     }
 
     #[test]
     fn output_option_uses_focused_command_when_provided() {
         assert_eq!(
-            output_option_from_config("focused", Some("printf 'DP-3\\n'"), false),
-            OutputOption::OutputName("DP-3".to_string())
+            output_option_from_config("focused", Some("printf 'DP-3\\n'")),
+            (
+                OutputOption::OutputName("DP-3".to_string()),
+                Some(StackOutputPolicy::Named("DP-3".to_string()))
+            )
         );
     }
 
@@ -1860,5 +2394,64 @@ mod tests {
             cmd_rx.try_recv().unwrap(),
             SourceCommand::Dismiss { id: 11 }
         );
+    }
+
+    #[test]
+    fn output_removal_rebuilds_visible_windows_without_losing_order() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::CompositorChosen);
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let _ = ui.apply_event(sample(2, "two"));
+        let old_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+
+        let _ = update(
+            &mut ui,
+            Message::OutputHotplug(OutputHotplugEvent::Removed {
+                name: Some("DP-1".to_string()),
+            }),
+        );
+
+        assert_eq!(ui.windows.len(), 2);
+        assert_eq!(ui.windows[0].notification_id, 2);
+        assert_eq!(ui.windows[1].notification_id, 1);
+        assert_ne!(ui.windows[0].window_id, old_window_ids[0]);
+        assert_ne!(ui.windows[1].window_id, old_window_ids[1]);
+    }
+
+    #[test]
+    fn unrelated_named_output_removal_keeps_existing_stack() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+        ui.stack_output_policy = Some(StackOutputPolicy::Named("DP-1".to_string()));
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let old_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+
+        let _ = update(
+            &mut ui,
+            Message::OutputHotplug(OutputHotplugEvent::Removed {
+                name: Some("HDMI-A-1".to_string()),
+            }),
+        );
+
+        let new_window_ids: Vec<IcedId> = ui.windows.iter().map(|w| w.window_id).collect();
+        assert_eq!(new_window_ids, old_window_ids);
+        assert_eq!(
+            ui.stack_output_policy,
+            Some(StackOutputPolicy::Named("DP-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn window_closed_removes_notification_binding() {
+        let (mut ui, _cmd_rx, _reload_tx) = test_ui(UiSection::default());
+
+        let _ = ui.apply_event(sample(1, "one"));
+        let window_id = ui.windows[0].window_id;
+
+        let _ = update(&mut ui, Message::WindowClosed(window_id));
+
+        assert!(ui.notifications.is_empty());
+        assert!(ui.windows.is_empty());
     }
 }

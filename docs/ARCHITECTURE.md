@@ -85,8 +85,10 @@ Known bug (tracked):
 
 - Multi-display focused-output behavior is still unreliable in some compositor setups.
   - Symptom: notifications can appear on a non-focused monitor even with `ui.output = "focused"`.
-  - Current behavior uses compositor-picked first popup + sticky stack heuristics (and optional `focused_output_command` override), but this does not fully match mako behavior yet.
-  - Likely fix direction: move from per-notification layer-shell surfaces to mako-like grouped/stacked surface ownership per output/anchor/layer (or introduce explicit compositor focus tracking via protocol integration).
+  - Current behavior is intentionally mako-like: when no popup stack exists, the first popup is compositor-chosen (or uses `focused_output_command` if configured); while a stack is visible, later popups stay on that same output.
+  - `wispd` clears sticky stack-output state when the popup stack becomes empty or windows are compositor-closed (for example after an output disappears), which avoids getting stuck on a disconnected monitor.
+  - `wispd` also subscribes to Wayland output registry changes and rebuilds visible popup windows only when the removed output could invalidate the current stack binding.
+  - This improves mako-style stack stickiness/recovery, but does not fully solve compositor-agnostic focused-output tracking.
 
 ## 5) Types and events
 
