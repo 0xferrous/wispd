@@ -7,6 +7,7 @@ members = [
   "bins/wisp-debug",
   "bins/wispd-monitor",
   "bins/wispd-forward",
+  "bins/wisp-random",
 ]
 resolver = "2"
 

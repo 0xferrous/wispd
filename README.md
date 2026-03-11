@@ -7,6 +7,7 @@ It includes:
 - **`wisp-debug`**: CLI/debug daemon to inspect incoming notifications and test close/action flows
 - **`wispd-monitor`**: passive D-Bus monitor for notifications traffic (does not own `org.freedesktop.Notifications`)
 - **`wispd-forward`**: forwards host notifications into a VM over SSH (keeps host daemon like `mako` active)
+- **`wisp-random`**: sends randomized test notifications over `org.freedesktop.Notifications`
 - Reusable crates:
   - `wisp-source` (D-Bus server + notification lifecycle)
   - `wisp-types` (shared notification/event types)
@@ -77,6 +78,15 @@ Checklist for `org.freedesktop.Notifications` support right now:
 
 ```bash
 cargo run -p wisp-debug
+```
+
+### Send randomized test notifications
+
+```bash
+cargo run -p wisp-random
+cargo run -p wisp-random -- --count 10 --interval-ms 500
+cargo run -p wisp-random -- --loop --interval-ms 750 --actions-always --icons-never
+cargo run -p wisp-random -- --replace-id 1 --persistent-only
 ```
 
 In another terminal:
