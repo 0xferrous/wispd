@@ -28,7 +28,7 @@ use iced_layershell::settings::{LayerShellSettings, Settings};
 use iced_layershell::to_layer_message;
 use serde::Deserialize;
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, delegate_noop,
     globals::{BindError, GlobalError, GlobalListContents, registry_queue_init},
@@ -694,6 +694,7 @@ impl WispdUi {
         );
         self.measured_heights.remove(&id);
         self.pending_measure.insert(id);
+        debug!(id, summary = %summary, app = %app_name, "notification entered pending measurement state");
 
         if self.windows.iter().any(|w| w.notification_id == id) {
             return Task::none();
@@ -1085,11 +1086,26 @@ fn update(state: &mut WispdUi, message: Message) -> Task<Message> {
         }
         Message::MeasuredPopupHeight { id, height } => {
             let Some(height) = height else {
+                warn!(
+                    id,
+                    pending = state.pending_measure.contains(&id),
+                    visible = state.windows.len(),
+                    known = state.notifications.contains_key(&id),
+                    "popup height measurement returned no bounds"
+                );
                 return Task::none();
             };
 
             let snapped = height.max(state.ui.height.max(1));
             let changed = state.measured_heights.get(&id).copied() != Some(snapped);
+
+            debug!(
+                id,
+                measured_height = height,
+                snapped_height = snapped,
+                changed,
+                "popup height measurement resolved"
+            );
 
             state.measured_heights.insert(id, snapped);
             state.pending_measure.remove(&id);
